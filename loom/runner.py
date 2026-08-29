@@ -1,0 +1,715 @@
+"""loom.runner — Tool runner: subprocess wrapper with scope, throttling, and
+structured output.
+
+The runner is the abstraction that every recon tool gets wrapped in. The
+runner:
+
+  1. Validates the tool is allowed by the active scope (banned_tools).
+  2. Injects mandatory headers (User-Agent, X-Bug-Bounty, etc.).
+  3. Optionally throttles via a shared RateLimiter (per-program budget).
+  4. Runs the subprocess with a hard timeout.
+  5. Captures stdout, classifies output by line (URL? subdomain? JSON?),
+     and emits EventLog entries.
+  6. Reports back a Result dataclass with: command, exit_code, duration,
+     output lines, parsed items, error.
+
+Output classification is tool-specific via a registered parser. Built-in
+parsers cover the tools loom will use directly (subfinder, httpx, naabu,
+nuclei, ffuf, katana, dnsx, amass). For anything else, pass
+parser="raw" and the runner returns the entire stdout as one item.
+
+This is the seam where streaming happens: a tool can return early with
+a partial result if a parser is registered for it.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import shlex
+import subprocess
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
+
+from .eventlog import EventLog
+from .log import tool_done, tool_failed, tool_start
+from .ratelimit import RateLimiter
+from .rambudget import RamBudget
+from .scope import Scope
+from .state import State
+from .tools import resolve_tool
+
+
+# -------- output item types --------
+
+@dataclass
+class OutputItem:
+    kind: str           # "subdomain" | "url" | "host" | "port" | "finding" | "raw"
+    value: str
+    evidence: dict = field(default_factory=dict)
+
+
+@dataclass
+class RunResult:
+    tool: str
+    command: list[str]
+    exit_code: int
+    duration_s: float
+    items: list[OutputItem]
+    stdout_tail: str = ""    # last 2KB of stdout (for debugging)
+    stderr_tail: str = ""
+    error: Optional[str] = None
+    timed_out: bool = False
+
+    def subdomains(self) -> list[str]:
+        return [i.value for i in self.items if i.kind == "subdomain"]
+
+    def urls(self) -> list[str]:
+        return [i.value for i in self.items if i.kind == "url"]
+
+    def hosts(self) -> list[str]:
+        return [i.value for i in self.items if i.kind == "host"]
+
+    def findings(self) -> list[OutputItem]:
+        return [i for i in self.items if i.kind == "finding"]
+
+
+# -------- parsers --------
+
+# Each parser takes raw stdout (string) and returns list[OutputItem].
+# Parsers should be PURE and FAST. They run in the main thread.
+
+_SUBDOMAIN_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)+$")
+_URL_RE = re.compile(r"^https?://[^\s]+$")
+_HOST_PORT_RE = re.compile(r"^([a-zA-Z0-9.\-]+):(\d+)$")
+_NUCLEI_FINDING_RE = re.compile(r"^\[([a-z0-9\-]+)\]\s+\[([a-zA-Z0-9_.\-]+)\]\s+\[([a-zA-Z0-9_.\-/]+)\]\s+(.+?)(?:\s+\[.*\])?$")
+
+
+def parse_subfinder(stdout: str) -> list[OutputItem]:
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s or s.startswith("["):
+            continue
+        if _SUBDOMAIN_RE.match(s):
+            items.append(OutputItem(kind="subdomain", value=s.lower(), evidence={"source": "subfinder"}))
+    return items
+
+
+def parse_httpx(stdout: str) -> list[OutputItem]:
+    """httpx -json output: each line is a JSON object with url, host, status, title, tech, etc."""
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        host = obj.get("host") or obj.get("input")
+        url = obj.get("url")
+        if host:
+            items.append(OutputItem(kind="host", value=host, evidence={
+                "url": url,
+                "status_code": obj.get("status_code"),
+                "title": obj.get("title"),
+                "tech": obj.get("tech", []),
+                "source": "httpx",
+            }))
+    return items
+
+
+def parse_naabu(stdout: str) -> list[OutputItem]:
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        m = _HOST_PORT_RE.match(s)
+        if m:
+            items.append(OutputItem(kind="port", value=f"{m.group(1)}:{m.group(2)}", evidence={"source": "naabu"}))
+    return items
+
+
+def parse_nuclei(stdout: str) -> list[OutputItem]:
+    """nuclei -json output: each line a JSON object with template-id, info, etc."""
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        template_id = obj.get("template-id") or obj.get("templateID")
+        matched_at = obj.get("matched-at") or obj.get("matched")
+        info = obj.get("info", {})
+        if template_id and matched_at:
+            items.append(OutputItem(kind="finding", value=str(matched_at), evidence={
+                "template_id": template_id,
+                "severity": info.get("severity"),
+                "name": info.get("name"),
+                "type": obj.get("type"),
+                "source": "nuclei",
+                "raw": obj,
+            }))
+    return items
+
+
+def parse_katana(stdout: str) -> list[OutputItem]:
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if _URL_RE.match(s):
+            items.append(OutputItem(kind="url", value=s, evidence={"source": "katana"}))
+    return items
+
+
+def parse_gau(stdout: str) -> list[OutputItem]:
+    return parse_katana(stdout)  # same shape
+
+
+def parse_wayback(stdout: str) -> list[OutputItem]:
+    return parse_katana(stdout)
+
+
+def parse_dnsx(stdout: str) -> list[OutputItem]:
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # dnsx -resp output: "sub.example.com [a] 1.2.3.4"
+        parts = s.split()
+        if parts and _SUBDOMAIN_RE.match(parts[0]):
+            items.append(OutputItem(kind="subdomain", value=parts[0].lower(), evidence={"source": "dnsx"}))
+    return items
+
+
+def parse_assetfinder(stdout: str) -> list[OutputItem]:
+    return parse_subfinder(stdout)
+
+
+def parse_amass(stdout: str) -> list[OutputItem]:
+    return parse_subfinder(stdout)
+
+
+def parse_raw(stdout: str) -> list[OutputItem]:
+    """No parsing — return entire stdout as a single raw item."""
+    if stdout.strip():
+        return [OutputItem(kind="raw", value=stdout.strip())]
+    return []
+
+
+PARSERS: dict[str, Callable[[str], list[OutputItem]]] = {
+    "subfinder": parse_subfinder,
+    "httpx": parse_httpx,
+    "naabu": parse_naabu,
+    "nuclei": parse_nuclei,
+    "katana": parse_katana,
+    "gau": parse_gau,
+    "waybackurls": parse_wayback,
+    "dnsx": parse_dnsx,
+    "assetfinder": parse_assetfinder,
+    "amass": parse_amass,
+    "ffuf": parse_raw,    # ffuf has JSON; v1 keeps raw
+    "raw": parse_raw,
+}
+
+
+# -------- header injection --------
+
+def _safe_host(host: str) -> str:
+    """Sanitize a host string for use as a directory name. Replaces any
+    character that isn't [A-Za-z0-9._-] with '_'."""
+    if not host:
+        return "_no_host_"
+    return re.sub(r"[^A-Za-z0-9._-]", "_", host)
+
+
+def _tool_outputs(
+    workdir: Path, stage: str, host: str, tool: str, ts_ms: int,
+) -> dict[str, Path]:
+    """Compute the output paths for a single tool invocation. The layout:
+        <workdir>/<stage>/<host>/<tool>.<ts_ms>.stdout.txt
+        <workdir>/<stage>/<host>/<tool>.<ts_ms>.stderr.txt
+        <workdir>/<stage>/<host>/<tool>.<ts_ms>.jsonl       (parsed items)
+        <workdir>/<stage>/<host>/<tool>.<ts_ms>.cmd.txt     (cmd + meta)
+    Directories are created on demand by the caller.
+    """
+    safe_host = _safe_host(host)
+    out_dir = workdir / stage / safe_host
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base = out_dir / f"{tool}.{ts_ms}"
+    return {
+        "stdout": base.with_suffix(".stdout.txt"),
+        "stderr": base.with_suffix(".stderr.txt"),
+        "jsonl": base.with_suffix(".jsonl"),
+        "cmd": base.with_suffix(".cmd.txt"),
+    }
+
+
+def _write_outputs(
+    paths: dict[str, Path],
+    *,
+    stdout: str,
+    stderr: str,
+    items: list[OutputItem],
+    cmd: list[str],
+    duration_s: float,
+    exit_code: int,
+    timed_out: bool,
+) -> None:
+    """Persist the four files for a single tool invocation."""
+    paths["stdout"].write_text(stdout, encoding="utf-8", errors="replace")
+    paths["stderr"].write_text(stderr, encoding="utf-8", errors="replace")
+    with open(paths["jsonl"], "w", encoding="utf-8") as f:
+        for it in items:
+            f.write(json.dumps({
+                "kind": it.kind, "value": it.value, "evidence": it.evidence,
+            }, ensure_ascii=False) + "\n")
+    meta = {
+        "cmd": cmd,
+        "duration_s": duration_s,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "stdout_bytes": len(stdout.encode("utf-8", "replace")),
+        "stderr_bytes": len(stderr.encode("utf-8", "replace")),
+        "item_count": len(items),
+    }
+    paths["cmd"].write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _inject_headers(cmd: list[str], headers: dict[str, str]) -> list[str]:
+    """For tools that accept -H 'Key: Value' (httpx, nuclei, katana, naabu),
+    append any scope headers that aren't already in the command.
+    """
+    if not headers:
+        return cmd
+
+    # Tools that support -H (alphabetical by binary name)
+    HEADER_TOOLS = {"httpx", "nuclei", "katana", "naabu", "dnsx", "ffuf"}
+    if not cmd:
+        return cmd
+    binary = Path(cmd[0]).name
+    if binary not in HEADER_TOOLS:
+        return cmd
+
+    # Build set of already-present header names
+    already: set[str] = set()
+    for tok in cmd:
+        if tok.startswith("-H") or tok.startswith("--header"):
+            pass  # we don't try to parse the value out of the next token
+    out = list(cmd)
+    for k, v in headers.items():
+        if k.lower() in {t.lower() for t in already}:
+            continue
+        out += ["-H", f"{k}: {v}"]
+    return out
+
+
+# -------- Runner --------
+
+class ToolBlocked(Exception):
+    """Raised when a tool is not allowed by the active scope."""
+
+
+class Runner:
+    def __init__(
+        self,
+        scope: Scope,
+        eventlog: Optional[EventLog] = None,
+        state: Optional[State] = None,
+        rate_limiter: Optional[RateLimiter] = None,
+        run_id: Optional[int] = None,
+        workdir: Optional[Path] = None,
+        log: Optional[logging.Logger] = None,
+        ram_budget: Optional["RamBudget"] = None,
+    ):
+        self.scope = scope
+        self.eventlog = eventlog
+        self.state = state
+        self.rate_limiter = rate_limiter
+        self.run_id = run_id
+        # When set, every tool invocation writes its stdout/stderr/parsed
+        # items/cmd to <workdir>/<stage>/<host>/<tool>.<ts>.<ext>.
+        self.workdir = Path(workdir) if workdir else None
+        # Live logger; one structured line per tool invocation.
+        self.log = log
+        # RAM budget (loom.rambudget.RamBudget). When set, each tool
+        # invocation reserves its estimated RSS before launch and
+        # releases it when the process exits — enforces the 20GB cap
+        # across concurrent fanout hosts.
+        self.ram_budget = ram_budget
+
+    def run(
+        self,
+        tool: str,
+        cmd: list[str],
+        *,
+        stage: str = "manual",
+        host: str = "",
+        parser: Optional[str] = None,
+        timeout: float = 600.0,
+        cwd: Optional[str] = None,
+        env_extra: Optional[dict[str, str]] = None,
+        check: bool = True,
+        stdin: Optional[str] = None,
+    ) -> RunResult:
+        """Run a tool synchronously. Returns RunResult.
+
+        - `parser`: name of the registered parser (default: tool name).
+        - `check`: if True, raises ToolBlocked when scope forbids the tool.
+        - `host`: per-host context for resume bookkeeping (Stage/host).
+
+        Throws ToolBlocked if check=True and scope disallows the tool.
+        """
+        if check and not self.scope.is_tool_allowed(tool):
+            raise ToolBlocked(f"tool {tool!r} blocked by scope {self.scope.name!r}")
+
+        # resolve the real binary (fixes e.g. python httpx shadowing
+        # projectdiscovery httpx on PATH) — only when the command is
+        # actually invoking the tool by name (stage builders pass
+        # [tool, ...flags]); tests that pass ["sh", "-c", ...] with a
+        # parser override must NOT be rewritten.
+        resolved = None
+        if cmd and Path(cmd[0]).name == tool:
+            resolved = resolve_tool(tool)
+        if resolved:
+            cmd = [resolved, *cmd[1:]]
+
+        # RAM budget: reserve estimated RSS for this invocation.
+        budget_reserved = False
+        if self.ram_budget is not None:
+            if not self.ram_budget.can_start(tool):
+                raise RuntimeError(
+                    f"RAM budget exceeded: {tool} cannot start "
+                    f"(cap {self.ram_budget.max_bytes / 1024**3:.1f} GB)"
+                )
+            self.ram_budget.acquire(tool)
+            budget_reserved = True
+
+        # throttle
+        if self.rate_limiter is not None:
+            self.rate_limiter.acquire(timeout=timeout)
+
+        # inject scope headers
+        full_cmd = _inject_headers(list(cmd), self.scope.request_headers())
+
+        # merge env
+        env = os.environ.copy()
+        if env_extra:
+            env.update(env_extra)
+
+        # Live log: tool start (the only log call before the work happens)
+        tool_start(self.log, stage, host, tool, full_cmd)
+
+        t0 = time.monotonic()
+        try:
+            proc = subprocess.run(
+                full_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=cwd,
+                env=env,
+                input=stdin,
+            )
+            duration = time.monotonic() - t0
+            stdout = proc.stdout or ""
+            stderr = proc.stderr or ""
+            exit_code = proc.returncode
+            error = None
+            timed_out = False
+        except subprocess.TimeoutExpired as e:
+            duration = time.monotonic() - t0
+            stdout = (e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or ""))
+            stderr = (e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or ""))
+            exit_code = -1
+            error = f"timeout after {timeout}s"
+            timed_out = True
+            tool_failed(self.log, stage, host, tool, error)
+        except FileNotFoundError as e:
+            duration = time.monotonic() - t0
+            err = f"binary not found: {e}"
+            tool_failed(self.log, stage, host, tool, err)
+            if budget_reserved and self.ram_budget is not None:
+                self.ram_budget.release(tool)
+            return RunResult(
+                tool=tool, command=full_cmd, exit_code=127, duration_s=duration,
+                items=[], error=err,
+            )
+
+        try:
+            parser_name = parser or tool
+            parse_fn = PARSERS.get(parser_name, parse_raw)
+            items = parse_fn(stdout)
+        finally:
+            # Release the RAM reservation no matter what.
+            if budget_reserved and self.ram_budget is not None:
+                self.ram_budget.release(tool)
+
+        # Write structured outputs if a workdir is configured.
+        output_path: Optional[str] = None
+        if self.workdir is not None:
+            ts_ms = int(time.time() * 1000)
+            paths = _tool_outputs(self.workdir, stage, host, tool, ts_ms)
+            try:
+                _write_outputs(
+                    paths,
+                    stdout=stdout,
+                    stderr=stderr,
+                    items=items,
+                    cmd=full_cmd,
+                    duration_s=duration,
+                    exit_code=exit_code,
+                    timed_out=timed_out,
+                )
+                output_path = str(paths["jsonl"])
+            except Exception:
+                # Don't let an output-write error break the run.
+                output_path = None
+
+        # log to event log
+        if self.eventlog is not None:
+            for it in items:
+                self.eventlog.append(
+                    type=it.kind,
+                    source=tool,
+                    host=host,
+                    value=it.value,
+                    evidence=it.evidence,
+                    stage=stage,
+                )
+
+        # mark in state
+        if self.state is not None and self.run_id is not None and host:
+            status = "done" if exit_code == 0 and not timed_out else ("timeout" if timed_out else "failed")
+            self.state.mark(
+                run_id=self.run_id,
+                host=host, tool=tool, stage=stage,
+                status=status,
+                duration_s=duration,
+                error=error or (stderr[-500:] if exit_code != 0 else None),
+                output_path=output_path,
+            )
+
+        # Live log: tool done (or failed for non-zero exit)
+        status = "done" if exit_code == 0 and not timed_out else (
+            "timeout" if timed_out else "failed"
+        )
+        tool_done(self.log, stage, host, tool,
+                  exit_code=exit_code, duration_s=duration,
+                  items=len(items), timed_out=timed_out, status=status)
+
+        return RunResult(
+            tool=tool,
+            command=full_cmd,
+            exit_code=exit_code,
+            duration_s=duration,
+            items=items,
+            stdout_tail=stdout[-2000:],
+            stderr_tail=stderr[-2000:],
+            error=error,
+            timed_out=timed_out,
+        )
+
+    def run_streaming(
+        self,
+        tool: str,
+        cmd: list[str],
+        *,
+        stage: str = "manual",
+        host: str = "",
+        parser: Optional[str] = None,
+        timeout: float = 600.0,
+        on_item: Optional[Callable[[OutputItem], None]] = None,
+        cwd: Optional[str] = None,
+        check: bool = True,
+        stdin: Optional[str] = None,
+    ) -> RunResult:
+        """Run a tool and stream items to `on_item` as they are parsed line by line.
+        This is what makes the DAG streaming work: katana can start feeding nuclei
+        before the crawl finishes.
+        """
+        if check and not self.scope.is_tool_allowed(tool):
+            raise ToolBlocked(f"tool {tool!r} blocked by scope {self.scope.name!r}")
+        # resolve the real binary (see resolve_tool) — only when the
+        # command invokes the tool by name, not when tests pass
+        # ["sh", "-c", ...] with a parser override
+        resolved = None
+        if cmd and Path(cmd[0]).name == tool:
+            resolved = resolve_tool(tool)
+        if resolved:
+            cmd = [resolved, *cmd[1:]]
+
+        # RAM budget: reserve estimated RSS for this invocation.
+        budget_reserved = False
+        if self.ram_budget is not None:
+            if not self.ram_budget.can_start(tool):
+                raise RuntimeError(
+                    f"RAM budget exceeded: {tool} cannot start "
+                    f"(cap {self.ram_budget.max_bytes / 1024**3:.1f} GB)"
+                )
+            self.ram_budget.acquire(tool)
+            budget_reserved = True
+
+        if self.rate_limiter is not None:
+            self.rate_limiter.acquire(timeout=timeout)
+
+        full_cmd = _inject_headers(list(cmd), self.scope.request_headers())
+        env = os.environ.copy()
+
+        # Live log: tool start
+        tool_start(self.log, stage, host, tool, full_cmd)
+
+        t0 = time.monotonic()
+        try:
+            proc = subprocess.Popen(
+                full_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE if stdin is not None else None,
+                text=True, cwd=cwd, env=env,
+            )
+        except FileNotFoundError as e:
+            err = f"binary not found: {e}"
+            tool_failed(self.log, stage, host, tool, err)
+            if budget_reserved and self.ram_budget is not None:
+                self.ram_budget.release(tool)
+            return RunResult(
+                tool=tool, command=full_cmd, exit_code=127, duration_s=0,
+                items=[], error=err,
+            )
+
+        if stdin is not None and proc.stdin is not None:
+            proc.stdin.write(stdin)
+            proc.stdin.close()
+
+        items: list[OutputItem] = []
+        parser_name = parser or tool
+        parse_fn = PARSERS.get(parser_name, parse_raw)
+        stdout_buf: list[str] = []
+        stderr_buf: list[str] = []
+
+        # We need to parse line-by-line but most parsers want full stdout.
+        # Compromise: collect lines, but as each line arrives, run a per-line
+        # parser if available, otherwise accumulate and parse at the end.
+        line_parsers = {
+            "subfinder": lambda l: _SUBDOMAIN_RE.match(l.strip()) and l.strip().lower(),
+            "assetfinder": lambda l: _SUBDOMAIN_RE.match(l.strip()) and l.strip().lower(),
+            "amass": lambda l: _SUBDOMAIN_RE.match(l.strip()) and l.strip().lower(),
+            "katana": lambda l: l.strip() if _URL_RE.match(l.strip()) else None,
+            "gau": lambda l: l.strip() if _URL_RE.match(l.strip()) else None,
+            "waybackurls": lambda l: l.strip() if _URL_RE.match(l.strip()) else None,
+            "naabu": lambda l: (_HOST_PORT_RE.match(l.strip()) and l.strip()),
+        }
+        per_line = line_parsers.get(parser_name)
+
+        deadline = t0 + timeout
+        try:
+            if per_line is not None:
+                assert proc.stdout is not None
+                for raw_line in proc.stdout:
+                    now = time.monotonic()
+                    if now > deadline:
+                        proc.kill()
+                        raise subprocess.TimeoutExpired(cmd=full_cmd, timeout=timeout)
+                    line = raw_line.rstrip("\n")
+                    # Keep the raw line (WITH newline) in the buffer so
+                    # the saved .stdout.txt / full_stdout stays intact —
+                    # stripping here glued every URL together when the
+                    # workdir writer joined the buffer (found live:
+                    # katana output on help.twilio.com).
+                    stdout_buf.append(raw_line)
+                    val = per_line(line)
+                    if val:
+                        item = OutputItem(kind=("subdomain" if parser_name in ("subfinder", "assetfinder", "amass") else ("url" if parser_name in ("katana", "gau", "waybackurls") else "port")),
+                                          value=val, evidence={"source": tool})
+                        items.append(item)
+                        if self.eventlog is not None:
+                            self.eventlog.append(type=item.kind, source=tool, host=host, value=item.value, evidence=item.evidence, stage=stage)
+                        if on_item is not None:
+                            on_item(item)
+            else:
+                # accumulate and parse at end
+                assert proc.stdout is not None
+                for raw_line in proc.stdout:
+                    if time.monotonic() > deadline:
+                        proc.kill()
+                        raise subprocess.TimeoutExpired(cmd=full_cmd, timeout=timeout)
+                    stdout_buf.append(raw_line)
+        finally:
+            try:
+                stderr_buf.append(proc.stderr.read() if proc.stderr else "")
+            except Exception:
+                pass
+            proc.wait()
+            # Release the RAM reservation once the process is gone.
+            if budget_reserved and self.ram_budget is not None:
+                self.ram_budget.release(tool)
+
+        duration = time.monotonic() - t0
+        timed_out = proc.returncode is None or (duration >= timeout and proc.returncode == -9)
+        exit_code = proc.returncode if proc.returncode is not None else -1
+        if per_line is None:
+            full_stdout = "".join(stdout_buf)
+            items = parse_fn(full_stdout)
+            if self.eventlog is not None:
+                for it in items:
+                    self.eventlog.append(type=it.kind, source=tool, host=host, value=it.value, evidence=it.evidence, stage=stage)
+            for it in items:
+                if on_item is not None:
+                    on_item(it)
+
+        error = f"timeout after {timeout}s" if timed_out else None
+
+        # Write structured outputs if a workdir is configured.
+        output_path: Optional[str] = None
+        if self.workdir is not None:
+            ts_ms = int(time.time() * 1000)
+            paths = _tool_outputs(self.workdir, stage, host, tool, ts_ms)
+            try:
+                _write_outputs(
+                    paths,
+                    stdout="".join(stdout_buf),
+                    stderr="".join(stderr_buf),
+                    items=items,
+                    cmd=full_cmd,
+                    duration_s=duration,
+                    exit_code=exit_code,
+                    timed_out=timed_out,
+                )
+                output_path = str(paths["jsonl"])
+            except Exception:
+                output_path = None
+
+        if self.state is not None and self.run_id is not None and host:
+            status = "done" if exit_code == 0 and not timed_out else ("timeout" if timed_out else "failed")
+            self.state.mark(
+                run_id=self.run_id,
+                host=host, tool=tool, stage=stage,
+                status=status,
+                duration_s=duration,
+                error=error or (("".join(stderr_buf))[-500:] if exit_code != 0 else None),
+                output_path=output_path,
+            )
+
+        # Live log: tool done
+        if not timed_out and exit_code != 0:
+            tool_failed(self.log, stage, host, tool, error or f"exit {exit_code}")
+        tool_done(self.log, stage, host, tool,
+                  exit_code=exit_code, duration_s=duration,
+                  items=len(items), timed_out=timed_out,
+                  status="done" if exit_code == 0 and not timed_out else (
+                      "timeout" if timed_out else "failed"))
+
+        return RunResult(
+            tool=tool, command=full_cmd, exit_code=exit_code, duration_s=duration,
+            items=items, stdout_tail=("".join(stdout_buf))[-2000:],
+            stderr_tail=("".join(stderr_buf))[-2000:],
+            error=error, timed_out=timed_out,
+        )

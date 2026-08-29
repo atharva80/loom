@@ -1,0 +1,184 @@
+#!/usr/bin/env bats
+# Tests for OUTPUT_VERBOSITY gating across core functions
+
+setup() {
+    TEST_DIR=$(mktemp -d)
+    ORIG_PATH="$PATH"
+    ORIG_IFS="$IFS"
+    MOCK_BIN="$TEST_DIR/mockbin"
+    mkdir -p "$MOCK_BIN"
+    export PATH="$MOCK_BIN:$PATH"
+    IFS=$'\n\t'
+    cd "$TEST_DIR" || exit 1
+
+    # Minimal color vars
+    bred=""
+    bblue=""
+    bgreen=""
+    byellow=""
+    yellow=""
+    reset=""
+    cyan=""
+    green=""
+    red=""
+    blue=""
+
+    # Stubs for sourced modules
+    SCRIPTPATH="${BATS_TEST_DIRNAME}/../.."
+    LOGFILE="/dev/null"
+    NOTIFICATION=false
+    DIFF=false
+    domain="test.com"
+    called_fn_dir="$TEST_DIR/.called_fn"
+    mkdir -p "$called_fn_dir"
+
+    # Stubs for functions used by start_func/end_func
+    getElapsedTime() { runtime="0s"; }
+    record_func_timing() { :; }
+    log_json() { :; }
+    # Stubs for disk-full guard helpers (Plan 01-02) sourced from modules/utils.sh
+    _check_disk_mid_run() { return 0; }
+    _abort_disk_full() { return 0; }
+
+    # Source common.sh (skip re-source guard)
+    _COMMON_SH_LOADED=""
+    source "${BATS_TEST_DIRNAME}/../../lib/common.sh"
+
+    # Extract individual functions from core.sh using sed
+    local corefile="${BATS_TEST_DIRNAME}/../../modules/core.sh"
+
+    # Extract notification function
+    eval "$(sed -n '/^function notification()/,/^}/p' "$corefile")"
+    # Extract start_func
+    eval "$(sed -n '/^function start_func()/,/^}/p' "$corefile")"
+    # Extract end_func
+    eval "$(sed -n '/^function end_func()/,/^}/p' "$corefile")"
+}
+
+teardown() {
+    PATH="$ORIG_PATH"
+    IFS="$ORIG_IFS"
+    cd /
+    rm -rf "$TEST_DIR"
+}
+
+create_mock_notify() {
+    cat >"$MOCK_BIN/notify" <<'EOF'
+#!/usr/bin/env bash
+cat >>"${NOTIFY_LOG}"
+EOF
+    chmod +x "$MOCK_BIN/notify"
+}
+
+###############################################################################
+# notification() verbosity tests
+###############################################################################
+
+@test "notification suppresses info at verbosity 1" {
+    OUTPUT_VERBOSITY=1
+    run notification "hello world" info
+    [ "$status" -eq 0 ]
+    [[ "$output" == "" ]]
+}
+
+@test "notification suppresses info at verbosity 0" {
+    OUTPUT_VERBOSITY=0
+    run notification "hello world" info
+    [ "$status" -eq 0 ]
+    [[ "$output" == "" ]]
+}
+
+@test "notification shows errors at verbosity 0" {
+    OUTPUT_VERBOSITY=0
+    run notification "something broke" error
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"something broke"* ]]
+}
+
+@test "notification shows all at verbosity 2" {
+    OUTPUT_VERBOSITY=2
+    run notification "detail info" info
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"detail info"* ]]
+}
+
+@test "notification sends suppressed messages to notify when enabled" {
+    create_mock_notify
+    export NOTIFY_LOG="$TEST_DIR/notify-suppressed.log"
+    NOTIFICATION=true
+    OUTPUT_VERBOSITY=1
+
+    run notification "hello world" info
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == "" ]]
+    [ -s "$NOTIFY_LOG" ]
+    grep -Fq "[INFO] hello world - test.com" "$NOTIFY_LOG"
+}
+
+@test "notification sends visible messages to notify when enabled" {
+    create_mock_notify
+    export NOTIFY_LOG="$TEST_DIR/notify-visible.log"
+    NOTIFICATION=true
+    OUTPUT_VERBOSITY=2
+
+    run notification "detail info" info
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"detail info"* ]]
+    [ -s "$NOTIFY_LOG" ]
+    grep -Fq "[INFO] detail info - test.com" "$NOTIFY_LOG"
+}
+
+###############################################################################
+# skip_notification() verbosity tests
+###############################################################################
+
+@test "skip_notification prints at verbosity 1" {
+    OUTPUT_VERBOSITY=1
+    run skip_notification "disabled"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SKIP"* ]]
+}
+
+@test "skip_notification suppressed at verbosity 0" {
+    OUTPUT_VERBOSITY=0
+    run skip_notification "disabled"
+    [ "$status" -eq 0 ]
+    [[ "$output" == "" ]]
+}
+
+###############################################################################
+# start_func / end_func verbosity tests
+###############################################################################
+
+@test "start_func silent at verbosity 1" {
+    OUTPUT_VERBOSITY=1
+    run start_func "test_fn" "Testing function"
+    [ "$status" -eq 0 ]
+    # start_func no longer produces visible output (only logs)
+    [[ "$output" == "" ]]
+}
+
+@test "start_func hides rule at verbosity 0" {
+    OUTPUT_VERBOSITY=0
+    run start_func "test_fn" "Testing function"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"──"* ]]
+}
+
+@test "end_func shows status at verbosity 1" {
+    OUTPUT_VERBOSITY=1
+    start=1
+    run end_func "Results" "test_fn"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"OK"* ]]
+}
+
+@test "end_func hides status at verbosity 0" {
+    OUTPUT_VERBOSITY=0
+    start=1
+    run end_func "Results" "test_fn"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"OK"* ]]
+}
