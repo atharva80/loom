@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import shlex
+import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -50,6 +51,32 @@ class OutputItem:
     kind: str           # "subdomain" | "url" | "host" | "port" | "finding" | "raw"
     value: str
     evidence: dict = field(default_factory=dict)
+
+
+def _classify_error(exit_code: int, stderr: str, timed_out: bool = False) -> Optional[str]:
+    """Produce a structured, non-empty error string for a failed tool run.
+
+    F24: before this, the error was only assigned as a side-effect at
+    mark() from `stderr[-500:]` — so a non-zero exit with EMPTY stderr
+    (e.g. dnsx `-H` bug) recorded an empty error and the real reason was
+    lost. This returns:
+      - None                     for success (exit 0, not timed out)
+      - "timeout after Ns"       when timed_out
+      - "killed by signal N"     when exit_code < 0 (negative returncode)
+      - "exit code N: <stderr>"  otherwise, with a truncation guard
+    """
+    if timed_out:
+        return "timeout (process killed)"
+    if exit_code == 0:
+        return None
+    if exit_code < 0:
+        try:
+            signame = signal.Signals(-exit_code).name
+        except (ValueError, AttributeError):
+            signame = f"signal {-exit_code}"
+        return f"killed by {signame} (exit code {exit_code})"
+    tail = stderr.strip()[-500:] if stderr.strip() else "(no stderr output)"
+    return f"exit code {exit_code}: {tail}"
 
 
 @dataclass
@@ -426,14 +453,14 @@ class Runner:
             stdout = proc.stdout or ""
             stderr = proc.stderr or ""
             exit_code = proc.returncode
-            error = None
             timed_out = False
+            error = _classify_error(exit_code, stderr, timed_out)
         except subprocess.TimeoutExpired as e:
             duration = time.monotonic() - t0
             stdout = (e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or ""))
             stderr = (e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or ""))
             exit_code = -1
-            error = f"timeout after {timeout}s"
+            error = _classify_error(exit_code, stderr, timed_out=True)
             timed_out = True
             tool_failed(self.log, stage, host, tool, error)
         except FileNotFoundError as e:
@@ -677,7 +704,12 @@ class Runner:
                 if on_item is not None:
                     on_item(it)
 
-        error = f"timeout after {timeout}s" if timed_out else None
+        # F24: structured error — non-empty even when stderr is empty
+        error = _classify_error(
+            exit_code,
+            "".join(stderr_buf),
+            timed_out=timed_out,
+        )
 
         # Write structured outputs if a workdir is configured.
         output_path: Optional[str] = None
