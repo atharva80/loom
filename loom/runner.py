@@ -586,8 +586,18 @@ class Runner:
             )
 
         if stdin is not None and proc.stdin is not None:
-            proc.stdin.write(stdin)
-            proc.stdin.close()
+            try:
+                proc.stdin.write(stdin)
+            except BrokenPipeError:
+                # Child closed stdin early (e.g. dnsx exited before
+                # consuming all subdomains). Ignore — the child
+                # decided it had enough input.
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
 
         items: list[OutputItem] = []
         parser_name = parser or tool
