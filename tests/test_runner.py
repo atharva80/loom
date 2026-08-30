@@ -289,7 +289,7 @@ class TestRunnerBasic:
             )
             assert result.exit_code == 7
             assert st.hosts_failed_for(run_id, "subfinder", "subenum") == {
-                "example.com": "oops\n"
+                "example.com": "exit code 7: oops"
             }
 
     def test_timeout_marks_timeout(self, tmp_path: Path):
