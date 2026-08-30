@@ -62,7 +62,7 @@ def _setup_run_dir(workdir: Path, run_id: int) -> dict[str, Path]:
     }
 
 
-def _print_stats(state: State, run_id: int) -> None:
+def _print_stats(state: State, run_id: int, workdir: Optional[Path] = None) -> None:
     """Print a human-readable status block for a run."""
     run = state.get_run(run_id)
     if not run:
@@ -72,6 +72,28 @@ def _print_stats(state: State, run_id: int) -> None:
           f"scope={run.get('scope_profile')}")
     print(f"  started_at : {run['started_at']}")
     print(f"  finished_at: {run.get('finished_at')}")
+    # F23: one-line summary (hosts/resolved/findings/failures/duration)
+    summary = state.run_summary(run_id, workdir=workdir)
+    if summary:
+        parts = [
+            f"{summary['tools']} tools",
+            f"{summary['done']} done",
+            f"{summary['failed']} failed",
+            f"{summary['skipped']} skipped",
+        ]
+        if summary["subdomains"]:
+            parts.append(f"{summary['subdomains']} subs")
+        if summary["resolved"]:
+            parts.append(f"{summary['resolved']} resolved")
+        if summary["urls"]:
+            parts.append(f"{summary['urls']} urls")
+        if summary["findings"]:
+            parts.append(f"{summary['findings']} findings")
+        if summary["failed_stages"]:
+            parts.append(f"failed_stages={','.join(summary['failed_stages'])}")
+        if summary["duration_s"] is not None:
+            parts.append(f"{summary['duration_s']}s")
+        print("  summary   : " + " ".join(parts))
     stats = state.stats(run_id)
     if not stats:
         print("  (no stages recorded)")
@@ -659,7 +681,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 return 1
         else:
             run_id = runs[0]["id"]
-        _print_stats(st, run_id)
+        _print_stats(st, run_id, workdir=workdir)
     return 0
 
 

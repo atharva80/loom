@@ -67,6 +67,34 @@ class TestStatusRunFlag:
         captured = capsys.readouterr()
         assert "not found" in (captured.out + captured.err)
 
+    def test_status_shows_summary_line(self, home_in_tmp, tmp_path, capsys):
+        """F23: `status --run N` prints a one-line summary with findings."""
+        wd = tmp_path
+        with State(wd / "loom.sqlite") as st:
+            r = st.start_run("example.com", mode="recon",
+                             scope_profile="default", pipeline="subdomain")
+            st.mark(r, "example.com", "subfinder", "subenum_subfinder", "done")
+            st.mark(r, "example.com", "dnsx", "resolve", "done")
+            st.mark(r, "example.com", "httpx", "probe", "done")
+            st.finish_run(r)
+        # events.jsonl with 2 findings
+        evdir = wd / f"run-{r}"
+        evdir.mkdir(parents=True, exist_ok=True)
+        with (evdir / "events.jsonl").open("w") as f:
+            f.write(json.dumps({"type": "finding", "value": "http://x.com",
+                                "evidence": {"severity": "high"},
+                                "stage": "vulnscan"}) + "\n")
+            f.write(json.dumps({"type": "finding", "value": "http://y.com",
+                                "evidence": {"severity": "medium"},
+                                "stage": "vulnscan"}) + "\n")
+        code = cli.main(["--workdir", str(wd), "status", "example.com",
+                          "--run", str(r)])
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "summary" in out
+        assert "3 tools" in out
+        assert "2 findings" in out
+
 
 class TestListRunsColumns:
     def test_list_runs_shows_pipeline(self, home_in_tmp, tmp_path, capsys):

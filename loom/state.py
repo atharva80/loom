@@ -173,6 +173,77 @@ class State:
         ).fetchall()
         return {r["host"]: r["error"] for r in rows}
 
+    # ---- run summary (F23) ----
+    def run_summary(self, run_id: int, workdir: Optional[str | Path] = None) -> Optional[dict]:
+        """One-line "how did it go?" summary for a run.
+
+        Returns a dict (or None if the run doesn't exist):
+          run_id, domain, pipeline, status, tools, done, failed, skipped,
+          running, timeout, failed_stages, subdomains, resolved, urls, hosts,
+          findings, duration_s
+        """
+        run = self.get_run(run_id)
+        if run is None:
+            return None
+
+        rows = self._conn.execute(
+            "SELECT status FROM tool_runs WHERE run_id=?",
+            (run_id,),
+        ).fetchall()
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+
+        failed_rows = self._conn.execute(
+            "SELECT stage FROM tool_runs WHERE run_id=? AND status='failed'",
+            (run_id,),
+        ).fetchall()
+        failed_stages = sorted({r["stage"] for r in failed_rows})
+
+        # Event counts from events.jsonl (when a workdir is known)
+        ev_counts: dict[str, int] = {}
+        if workdir is not None:
+            ev_file = Path(workdir) / f"run-{run_id}" / "events.jsonl"
+            if ev_file.exists():
+                import json as _json
+                try:
+                    for line in ev_file.open():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ev = _json.loads(line)
+                            k = ev.get("type", ev.get("kind", ""))
+                            ev_counts[k] = ev_counts.get(k, 0) + 1
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        duration_s = None
+        if run.get("finished_at") and run.get("started_at"):
+            duration_s = round(run["finished_at"] - run["started_at"], 1)
+
+        return {
+            "run_id": run_id,
+            "domain": run.get("domain"),
+            "pipeline": run.get("pipeline"),
+            "status": "finished" if run.get("finished_at") else "running",
+            "tools": len(rows),
+            "done": counts.get("done", 0),
+            "failed": counts.get("failed", 0),
+            "skipped": counts.get("skipped", 0),
+            "running": counts.get("running", 0),
+            "timeout": counts.get("timeout", 0),
+            "failed_stages": failed_stages,
+            "subdomains": ev_counts.get("subdomain", 0),
+            "resolved": ev_counts.get("resolved", 0),
+            "urls": ev_counts.get("url", 0),
+            "hosts": ev_counts.get("host", 0),
+            "findings": ev_counts.get("finding", 0),
+            "duration_s": duration_s,
+        }
+
     def stats(self, run_id: int) -> dict:
         rows = self._conn.execute(
             """SELECT stage, status, COUNT(*) as n
