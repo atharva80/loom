@@ -292,8 +292,10 @@ def _inject_headers(cmd: list[str], headers: dict[str, str]) -> list[str]:
     if not headers:
         return cmd
 
-    # Tools that support -H (alphabetical by binary name)
-    HEADER_TOOLS = {"httpx", "nuclei", "katana", "naabu", "dnsx", "ffuf"}
+    # Tools that support -H (alphabetical by binary name).
+    # dnsx/naabu are DNS/port scanners that don't accept HTTP headers.
+    # Verified 2026-08-30: dnsx errors "flag provided but not defined: -H".
+    HEADER_TOOLS = {"httpx", "nuclei", "katana", "ffuf"}
     if not cmd:
         return cmd
     binary = Path(cmd[0]).name
