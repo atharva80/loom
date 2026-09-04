@@ -58,7 +58,7 @@ class TestFullPipelineCLI:
         assert set(stages) == set(dag.ids())
         # deep includes infra stages the full pipeline lacks
         for node in ("portscan", "permute", "tls", "subenum_uncover",
-                     "takeover", "fuzz"):
+                     "subenum_amass", "takeover", "fuzz"):
             assert node in stages
 
     def test_missing_required_tool_exits_2(self, home_in_tmp, tmp_path, capsys,

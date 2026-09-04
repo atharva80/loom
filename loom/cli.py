@@ -395,8 +395,8 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
     from .stages import (
         make_assetfinder_stage, make_dnsx_stage, make_httpx_stage,
         make_katana_stage, make_nuclei_stage, make_subfinder_stage,
-        make_alterx_stage, make_arjun_stage, make_asnmap_stage,
-        make_crlfuzz_stage, make_dalfox_stage,
+        make_alterx_stage, make_amass_stage, make_arjun_stage,
+        make_asnmap_stage, make_crlfuzz_stage, make_dalfox_stage,
         make_ffuf_stage, make_gau_stage, make_gowitness_stage,
         make_hakrawler_stage, make_jssecrets_stage, make_kxss_stage,
         make_naabu_stage, make_subjack_stage,
@@ -623,13 +623,17 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
         dag.add(Node(id="subenum_subfinder", outputs={"subdomain"}))
         dag.add(Node(id="subenum_assetfinder", outputs={"subdomain"}))
         dag.add(Node(id="subenum_uncover", outputs={"subdomain"}))
+        # v0.6.1: amass brute-forcing with best-dns-wordlist joins the
+        # passive sources (timeout-bounded; shares into the pool).
+        dag.add(Node(id="subenum_amass", outputs={"subdomain"}))
         dag.add(Node(
             id="permute", inputs={"subdomain"},
             depends_on=["subenum_subfinder", "subenum_assetfinder",
-                        "subenum_uncover"],
+                        "subenum_uncover", "subenum_amass"],
             should_run=lambda s: (s.from_node("subenum_subfinder", "subdomain")
                                   + s.from_node("subenum_assetfinder", "subdomain")
-                                  + s.from_node("subenum_uncover", "subdomain")) > 0,
+                                  + s.from_node("subenum_uncover", "subdomain")
+                                  + s.from_node("subenum_amass", "subdomain")) > 0,
         ))
         dag.add(Node(
             id="resolve", inputs={"subdomain"},
@@ -637,7 +641,8 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             should_run=lambda s: s.from_node("permute", "subdomain") > 0
             or (s.from_node("subenum_subfinder", "subdomain")
                 + s.from_node("subenum_assetfinder", "subdomain")
-                + s.from_node("subenum_uncover", "subdomain")) > 0,
+                + s.from_node("subenum_uncover", "subdomain")
+                + s.from_node("subenum_amass", "subdomain")) > 0,
         ))
         dag.add(Node(
             id="tls", depends_on=["resolve"],
@@ -715,6 +720,7 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             "subenum_subfinder": make_subfinder_stage(),
             "subenum_assetfinder": make_assetfinder_stage(),
             "subenum_uncover": make_uncover_stage(),
+            "subenum_amass": make_amass_stage(brute=True, timeout=900.0),
             "permute": make_alterx_stage(),
             "resolve": make_dnsx_stage(),
             "tls": make_tlsx_stage(),
@@ -1010,6 +1016,18 @@ def cmd_validate(args: argparse.Namespace) -> int:
     ok = len(report) - len(missing)
     print(f"  {ok} present, {len(missing)} missing"
           + (f", {shadowed} shadowed" if shadowed else ""))
+
+    # Wordlists (AssetNote etc.) — advisory only, never fail the check.
+    from .wordlists import EXPECTED_WORDLISTS, wordlist_dir, wordlist_status
+    present, wmissing = wordlist_status()
+    print()
+    print(f"loom wordlists — {wordlist_dir()} ({len(present)}/{len(EXPECTED_WORDLISTS)} present)")
+    for fname, _purpose in EXPECTED_WORDLISTS:
+        mark = "ok" if fname in present else "--"
+        print(f"  [{mark}] {fname}")
+    if wmissing:
+        print("  (missing lists fall back gracefully: SecLists common.txt,")
+        print("   arjun default wordlist, amass passive-only)")
     return 0 if not missing else 1
 
 

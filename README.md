@@ -71,6 +71,15 @@ loom sweeps --scopes-file scopes.csv --workdir ~/bbdata   # cron-friendly wrappe
 loom findings --workdir ~/bbdata
 loom findings --workdir ~/bbdata --json
 
+# Wordlists (AssetNote, tech-gated fuzz — see loom/wordlists.py)
+# setup once: download from https://wordlists.assetnote.io/data/*.json
+# manifests into /opt/tools/wordlists/assetnote, then create the stable
+# top-N slices (lists are frequency-ordered, head keeps the best):
+#   head -20000 httparchive_apiroutes_* > api-routes-top20k.txt
+#   head -25000 httparchive_parameters_* > params-top25k.txt
+#   ... (full mapping in loom/wordlists.py docstring)
+loom validate --workdir ~/bbdata   # also reports wordlist status
+
 # Watch it live (separate terminal)
 loom status-server --workdir ~/bbdata --port 8080
 

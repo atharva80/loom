@@ -128,6 +128,11 @@ class TestWordlistResolution:
         fake_list.write_text("admin\n")
         monkeypatch.setattr(st, "_FFUF_WORDLIST_CANDIDATES",
                             (str(tmp_path / "missing.txt"), str(fake_list)))
+        # Isolate from any real AssetNote dir (tech-gated lookup runs
+        # before the candidates chain).
+        empty_wl = tmp_path / "empty-wl"
+        empty_wl.mkdir()
+        monkeypatch.setenv("LOOM_WORDLISTS", str(empty_wl))
         runner = Runner(_scope(), workdir=tmp_path)
         ctx = PipelineContext(scope=runner.scope)
         ctx.extras["urls"] = ["https://example.com/"]
@@ -146,6 +151,11 @@ class TestWordlistResolution:
         self._fake_ffuf(tmp_path, monkeypatch)
         monkeypatch.setattr(st, "_FFUF_WORDLIST_CANDIDATES",
                             (str(tmp_path / "nope.txt"),))
+        # Isolate from any real AssetNote dir (tech-gated lookup runs
+        # before the candidates chain).
+        empty_wl = tmp_path / "empty-wl"
+        empty_wl.mkdir()
+        monkeypatch.setenv("LOOM_WORDLISTS", str(empty_wl))
         runner = Runner(_scope(), workdir=tmp_path)
         ctx = PipelineContext(scope=runner.scope)
         ctx.extras["urls"] = ["https://example.com/"]

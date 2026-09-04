@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.6.1 — 2026-09-05
+
+AssetNote wordlists: tech-gated fuzzing, arjun params, amass brute.
+
+### New features
+
+- **Wordlist layer** (`loom/wordlists.py`, outside the repo at
+  `/opt/tools/wordlists/assetnote`, `LOOM_WORDLISTS` override):
+  22 stable files (api-routes/params/php/aspx/js top-N slices +
+  per-tech lists + best-dns), decoupled from AssetNote date stamps.
+- **Tech-gated ffuf** — httpx fingerprints pick the wordlist
+  (IIS/ASP.NET → aspx-top10k, php → php-top15k, ...), unknown tech →
+  api-routes-top20k, no dir → SecLists common → built-in mini.
+  Fallback chain never breaks; selection deterministic.
+- **Arjun `-w`** params-top25k (matches arjun's default 25.9k cost,
+  higher quality).
+- **amass brute node** (`subenum_amass`, `deep`): `-brute -w
+  best-dns-top20k` (frequency-ordered head of the 9.5M list) after
+  passive searches, 900s budget, shares into the pool (amass
+  previously never shared). Full 9.5M stays on disk for opt-in.
+- **`loom validate`** reports wordlist status (advisory, never fails).
+
+### Verification notes
+
+- amass brute smoke-verified live (flags + wordlist accepted; full
+  yield needs the node time budget — amass scaffolds recon before
+  first brute hits, partial stdout still parses on timeout).
+- ffuf tech gating verified against the real dir; api-routes entries
+  carry leading slashes (servers normalize `//` — verified live).
+
 ## v0.6.0 — 2026-09-05
 
 Tier-2 pass: hidden-parameter discovery, JS secret mining, ASN

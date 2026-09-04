@@ -437,14 +437,44 @@ def make_gau_stage(*, bin_path: Optional[str] = None,
     return _stage
 
 
+def amass_command(domain: str, *, bin_path: str = "amass",
+                  brute: bool = False,
+                  wordlist: Optional[str] = None,
+                  timeout: float = 600.0) -> list[str]:
+    """amass enum -passive (default) or -brute -w <wl> for subdomain
+    brute-forcing with best-dns-wordlist (v0.6.1)."""
+    cmd = [bin_path, "enum"]
+    if brute:
+        cmd.append("-brute")
+        if wordlist:
+            cmd += ["-w", wordlist]
+    else:
+        cmd.append("-passive")
+    return cmd + ["-d", domain]
+
+
 def make_amass_stage(*, bin_path: Optional[str] = None,
-                     timeout: float = 600.0) -> StageFn:
+                     timeout: float = 600.0,
+                     brute: bool = False,
+                     wordlist: Optional[str] = None) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
-        cmd = [bin_path or DEFAULT_BIN["amass"], "enum", "-passive", "-d", host]
+        wl = wordlist
+        if brute and not wl:
+            from .wordlists import best_dns_wordlist
+            hit = best_dns_wordlist()
+            wl = str(hit) if hit else None
+        cmd = amass_command(host, bin_path=bin_path or DEFAULT_BIN["amass"],
+                            brute=brute, wordlist=wl, timeout=timeout)
         result = runner.run(
             "amass", cmd, stage="subenum", host=host,
             parser="amass", timeout=timeout, check=True,
         )
+        # Share with resolve (previously amass never shared, so its
+        # subs were invisible downstream).
+        subs = ctx.extras.setdefault("subdomains", [])
+        for it in result.items:
+            if it.kind == "subdomain" and it.value not in subs:
+                subs.append(it.value)
         return result.items
     return _stage
 
@@ -477,6 +507,14 @@ def make_ffuf_stage(*, bin_path: Optional[str] = None,
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
         nonlocal wordlist
         host = _bare_host(host)
+        if not wordlist:
+            # 1. Tech-gated AssetNote list (httpx fingerprints feed
+            #    ctx.extras["tech"]; v0.6.1). 2. SecLists candidates.
+            # 3. Built-in mini list.
+            from .wordlists import wordlist_for
+            hit = wordlist_for(ctx.extras.get("tech") or set())
+            if hit:
+                wordlist = str(hit)
         if not wordlist:
             for cand in _FFUF_WORDLIST_CANDIDATES:
                 if Path(cand).is_file():
@@ -1012,29 +1050,40 @@ _ARJUN_UA = "Mozilla/5.0 (X11; Linux x86_64) loom/1.0"
 def arjun_command(url: str, out_file: Path | str, *,
                   bin_path: str = "arjun",
                   threads: int = 10,
-                  req_timeout: int = 10) -> list[str]:
+                  req_timeout: int = 10,
+                  wordlist: Optional[str] = None) -> list[str]:
     """arjun -u <url> -oT <textfile> (GET lines are full URLs).
 
     Verified against the bundled source (exporter.py): -oT writes one
     URL per line for GET; `<url>\\t<query>` for POST-found params.
+    wordlist → AssetNote params-top25k (v0.6.1); None = arjun default.
     """
-    return [
+    cmd = [
         bin_path, "-u", url, "-oT", str(out_file),
         "-t", str(threads), "-T", str(req_timeout),
         "-m", "GET", "-q",
     ]
+    if wordlist:
+        cmd += ["-w", wordlist]
+    return cmd
 
 
 def make_arjun_stage(*, bin_path: Optional[str] = None,
                      timeout: float = 300.0,
                      max_urls: int = 10,
-                     threads: int = 10) -> StageFn:
+                     threads: int = 10,
+                     wordlist: Optional[str] = None) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
         # Arjun is request-heavy (~1k+ reqs/URL): feed it normalized
         # PARAMLESS representatives only — parameterized pages already
         # feed dalfox directly, and variants would re-test identically.
         from .runner import parse_arjun as _parse_arjun
+        from .wordlists import arjun_params_wordlist
         host = _bare_host(host)
+        wl = wordlist
+        if wl is None:
+            hit = arjun_params_wordlist()
+            wl = str(hit) if hit else None
         reps, _ = normalize_urls(ctx.extras.get("urls") or [])
         targets = [u for u in reps if "?" not in u][:max_urls]
         if not targets:
@@ -1047,7 +1096,7 @@ def make_arjun_stage(*, bin_path: Optional[str] = None,
             out = tdir / f"arjun-{i}.txt"
             cmd = arjun_command(
                 target, out, bin_path=bin_path or DEFAULT_BIN["arjun"],
-                threads=threads)
+                threads=threads, wordlist=wl)
             result = runner.run(
                 "arjun", cmd, stage="params", host=host,
                 parser="raw", timeout=timeout, check=True,
