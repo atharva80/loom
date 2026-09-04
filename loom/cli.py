@@ -146,6 +146,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     running each scope's pipeline (one run row per scope).
     """
     scopes_file = getattr(args, "scopes_file", None)
+    if not getattr(args, "domain", None) and not scopes_file:
+        print("error: provide a domain or --scopes-file",
+              file=sys.stderr)
+        return 2
     if scopes_file:
         from .scopecsv import parse_scopes_csv
         entries = parse_scopes_csv(scopes_file)
@@ -1386,7 +1390,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # run
     pr = sub.add_parser("run", help="start a new run against a domain")
-    pr.add_argument("domain", help="target domain (e.g. example.com)")
+    pr.add_argument("domain", nargs="?",
+                    help="target domain (e.g. example.com; omit with --scopes-file)")
     pr.add_argument("--scope", default="default",
                     help="scope profile name (default: default)")
     pr.add_argument("--mode", default="recon",

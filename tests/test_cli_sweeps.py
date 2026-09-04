@@ -159,3 +159,24 @@ class TestSweepsTimeout:
                          "--scopes-file", str(csv)])
         assert code == 0
         assert calls == ["a.example.com", "b.example.com"]
+
+
+class TestRunScopesFile:
+    """`run --scopes-file` must not require a positional domain."""
+
+    def test_scopes_file_needs_no_domain(
+            self, home_in_tmp, tmp_path, monkeypatch):
+        csv = tmp_path / "scopes.csv"
+        csv.write_text("a.example.com,catchall,1\nb.example.com,catchall,1\n")
+        seen = []
+        monkeypatch.setattr(
+            cli, "_run_one", lambda child: seen.append(child.domain) or 0)
+        code = cli.main(["--workdir", str(tmp_path), "run",
+                         "--scopes-file", str(csv)])
+        assert code == 0
+        assert seen == ["a.example.com", "b.example.com"]
+
+    def test_bare_run_still_exits_2(self, home_in_tmp, tmp_path, capsys):
+        code = cli.main(["--workdir", str(tmp_path), "run"])
+        assert code == 2
+        assert "domain" in capsys.readouterr().err.lower()

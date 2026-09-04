@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.8.9 — 2026-09-05
+
+`run --scopes-file` no longer demands a positional domain.
+
+- **The gap**: the multi-scope mode required `domain` positionally,
+  so `run --scopes-file scopes.csv` died in argparse. Bare `run`
+  still exits 2 with a clear error (exit-code contract unchanged).
+- **Proof**: `TestRunScopesFile` (file-only invocation runs both
+  scopes; bare run → 2); live 2-scope `run --scopes-file` verified,
+  plus `status --json` read back mid-sweep.
+
 ## v0.8.8 — 2026-09-05
 
 Sweeps --timeout: one hung scope no longer stalls the night.
