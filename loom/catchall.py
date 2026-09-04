@@ -78,25 +78,18 @@ def _looks_like_html(body: bytes) -> bool:
     return head.startswith(b"<!doctype") or head.startswith(b"<html") or b"<html" in head[:300]
 
 
-def detect(host: str, https: bool = True, timeout: float = 8.0) -> dict:
-    """Probe host for catch-all behavior.
+def _probe_set(base: str, timeout: float):
+    """Fetch /, + two random paths. Returns (root, rand1, rand2)."""
+    return (
+        _http_get(base + "/", timeout=timeout),
+        _http_get(base + _random_path(1), timeout=timeout),
+        _http_get(base + _random_path(2), timeout=timeout),
+    )
 
-    Returns:
-      {
-        "host": str,
-        "classification": "clean" | "catchall" | "soft" | "error",
-        "confidence": float (0.0-1.0),
-        "evidence": dict,
-      }
-    """
-    scheme = "https" if https else "http"
-    base = f"{scheme}://{host}"
 
-    root = _http_get(base + "/", timeout=timeout)
-    rand1 = _http_get(base + _random_path(1), timeout=timeout)
-    rand2 = _http_get(base + _random_path(2), timeout=timeout)
-
-    evidence = {
+def _evidence_for(root, rand1, rand2, scheme: str) -> dict:
+    return {
+        "scheme": scheme,
         "root_status": root.status if root else None,
         "root_size": root.body_size if root else None,
         "root_hash": root.body_hash if root else None,
@@ -107,6 +100,11 @@ def detect(host: str, https: bool = True, timeout: float = 8.0) -> dict:
         "rand2_size": rand2.body_size if rand2 else None,
         "rand2_hash": rand2.body_hash if rand2 else None,
     }
+
+
+def _classify(host: str, root, rand1, rand2, scheme: str) -> dict:
+    """Classify from one scheme's probe set. Thresholds unchanged."""
+    evidence = _evidence_for(root, rand1, rand2, scheme)
 
     if not root or root.status == 0:
         return {"host": host, "classification": "error", "confidence": 1.0, "evidence": evidence}
@@ -154,3 +152,35 @@ def detect(host: str, https: bool = True, timeout: float = 8.0) -> dict:
 
     # Default: clean
     return {"host": host, "classification": "clean", "confidence": 0.6, "evidence": evidence}
+
+
+def detect(host: str, https: bool = True, timeout: float = 8.0) -> dict:
+    """Probe host for catch-all behavior.
+
+    `https=True` prefers TLS but falls back to plaintext http when the
+    TLS root probe fails (live 2026-09-05: vulnweb.com has no TLS
+    listener; https-only probing misclassified it "error" conf=1.0
+    although http serves fine). "error" is returned only when every
+    tried scheme fails at /. The working scheme is recorded in
+    `evidence["scheme"]`.
+
+    Returns:
+      {
+        "host": str,
+        "classification": "clean" | "catchall" | "soft" | "error",
+        "confidence": float (0.0-1.0),
+        "evidence": dict,
+      }
+    """
+    schemes = ("https", "http") if https else ("http",)
+    pending = None
+    for scheme in schemes:
+        root, rand1, rand2 = _probe_set(f"{scheme}://{host}", timeout)
+        if root is not None and root.status != 0:
+            return _classify(host, root, rand1, rand2, scheme)
+        pending = (root, rand1, rand2, scheme)
+    # Every scheme failed at / → error; evidence from the last attempt.
+    assert pending is not None
+    root, rand1, rand2, scheme = pending
+    return {"host": host, "classification": "error", "confidence": 1.0,
+            "evidence": _evidence_for(root, rand1, rand2, scheme)}

@@ -770,7 +770,11 @@ def _make_catchall_stage(log, catchall_mod):
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
         log.stage_start("catchall", host=host)
         t0 = time.monotonic()
-        result = catchall_mod.detect(host, https=True, timeout=15.0)
+        # detect() is blocking urllib (3 probes x timeout); keep it off
+        # the event loop so level-mates keep running (v0.8 async rule).
+        import asyncio
+        result = await asyncio.to_thread(
+            catchall_mod.detect, host, True, 15.0)
         duration = time.monotonic() - t0
         classification = (result.get("classification")
                           or result.get("kind") or "unknown")

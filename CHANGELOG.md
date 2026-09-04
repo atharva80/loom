@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.8.1 — 2026-09-05
+
+Catchall accuracy: HTTPS→HTTP fallback + off-loop probing.
+
+- **The bug** (found live via the v0.8.0 verification run):
+  `detect(host, https=True)` probed TLS only and declared `"error"`
+  conf=1.0 when there was no TLS listener — even for hosts serving
+  HTTP perfectly well. Every HTTP-only target was misreported as dead
+  in manifests, summaries, and agent-facing events.
+- **The fix** (`loom/catchall.py`): `https=True` now means "prefer
+  TLS, fall back to plaintext" — the full 3-probe set is retried over
+  http when the TLS root probe fails. `"error"` requires every tried
+  scheme to fail at `/`. Thresholds unchanged; the working scheme is
+  recorded in `evidence["scheme"]`.
+- **Off the event loop** (`loom/cli.py`): the stage wrapper now runs
+  `detect()` in `asyncio.to_thread` — 3×15s of blocking urllib no
+  longer holds the loop (the v0.8 async rule, applied to the one
+  caller that bypasses the Runner).
+- **Proof**: 4 new `test_catchall.py` tests (local HTTP-only servers
+  classify clean/catchall via fallback, dead ports still `error`);
+  live `testasp.vulnweb.com`: old `error`/1.0 → new `clean`/0.95 over
+  `scheme=http`.
+
 ## v0.8.0 — 2026-09-05
 
 True-async runner: `Runner.run()` / `run_streaming()` are now coroutines

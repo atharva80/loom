@@ -167,3 +167,30 @@ def test_clean_app_root_and_random_differ(real_app_server):
     assert e["root_hash"] != e["rand1_hash"]
     assert e["rand1_status"] == 404
     assert e["root_status"] == 200
+
+
+def test_https_falls_back_to_http_clean(real_app_server):
+    """HTTP-only host must not be 'error' when https=True.
+
+    Live 2026-09-05: vulnweb.com has no TLS listener, so https-only
+    probing classified it 'error' conf=1.0 although http serves fine.
+    """
+    r = detect(real_app_server, https=True, timeout=5)
+    assert r["classification"] == "clean"
+    assert r["evidence"]["scheme"] == "http"
+
+
+def test_https_falls_back_to_http_catchall(catchall_server):
+    r = detect(catchall_server, https=True, timeout=5)
+    assert r["classification"] == "catchall"
+    assert r["evidence"]["scheme"] == "http"
+
+
+def test_error_only_when_both_schemes_fail():
+    r = detect(f"127.0.0.1:{_free_port()}", https=True, timeout=2)
+    assert r["classification"] == "error"
+
+
+def test_scheme_recorded_for_plain_http(real_app_server):
+    r = detect(real_app_server, https=False, timeout=3)
+    assert r["evidence"]["scheme"] == "http"
