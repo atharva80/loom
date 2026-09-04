@@ -728,8 +728,14 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
         ))
         dag.add(Node(
-            id="fuzz", depends_on=["probe"],
-            should_run=lambda s: s.from_node("probe", "url") > 0,
+            id="fuzz", depends_on=["probe", "urls", "urls_gau"],
+            # Host gate (not probe-only): ffuf fuzzes _live_hosts(ctx) ←
+            # extras["urls"] (any source) + resolved subs + root. Same
+            # incident class as the scan gate (v0.8.4).
+            should_run=lambda s: (s.from_node("urls", "url")
+                                  + s.from_node("urls_gau", "url")
+                                  + s.from_node("probe", "url")) > 0
+            or s.from_node("resolve", "subdomain") > 0,
         ))
         dag.add(Node(
             id="scan", inputs={"url"}, depends_on=["probe", "urls", "urls_gau", "params", "jssecrets"],

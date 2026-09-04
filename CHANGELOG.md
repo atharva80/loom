@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.8.5 — 2026-09-05
+
+Fuzz gate widened to known hosts (same hole as scan).
+
+- **The audit**: `fuzz` (ffuf) gated only on probe urls, but the
+  stage fuzzes `_live_hosts(ctx)` ← passive urls + resolved subs +
+  root. Probe-only gating would skip it on exactly the degraded
+  runs where directory fuzzing still has targets.
+- **The fix** (deep pipeline): gate is now the url pool OR resolved
+  subdomains; `depends_on` extended to `urls`/`urls_gau` so the gate
+  reads settled counts. `screenshot` remains the only probe-gated
+  node, deliberately (chrome launches need live targets).
+- **Proof** (`tests/test_fuzz_gate.py`): predicate units
+  (passive-only / resolve-only / probe-only → run, empty → skip)
+  plus end-to-end with the real predicate in a live Pipeline.
+
 ## v0.8.4 — 2026-09-05
 
 Scan gate widened to the URL pool (nuclei no longer sits out).
