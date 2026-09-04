@@ -399,13 +399,12 @@ class TestRunnerStreaming:
         assert el.count(type_="url") == 2
 
     def test_streaming_unknown_parser_buffers(self, tmp_path: Path):
-        # ffuf uses parse_raw (no per-line streaming) — items should still appear,
-        # just at the end.
+        # parser="raw" buffers all output as one item at the end.
         runner = Runner(self._scope())
         result = runner.run_streaming(
-            "ffuf",
+            "myfake",
             ["sh", "-c", "printf 'result line 1\\nresult line 2\\n'"],
-            stage="fuzz", host="example.com", parser="ffuf", timeout=5.0,
+            stage="fuzz", host="example.com", parser="raw", timeout=5.0,
         )
         assert len(result.items) == 1
         assert "result line 1" in result.items[0].value

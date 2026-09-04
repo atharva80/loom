@@ -318,6 +318,37 @@ def parse_alterx(stdout: str) -> list[OutputItem]:
     return items
 
 
+def parse_ffuf_jsonl(stdout: str) -> list[OutputItem]:
+    """ffuf -json output: newline-delimited JSON records.
+
+    Emits finding items for fuzz hits (url, status, input, length).
+    """
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        url = obj.get("url")
+        if not url:
+            continue
+        items.append(OutputItem(
+            kind="finding", value=str(url),
+            evidence={
+                "source": "ffuf",
+                "vuln": "content-discovery",
+                "status": obj.get("status"),
+                "input": obj.get("input"),
+                "length": obj.get("length"),
+                "words": obj.get("words"),
+            },
+        ))
+    return items
+
+
 PARSERS: dict[str, Callable[[str], list[OutputItem]]] = {
     "subfinder": parse_subfinder,
     "httpx": parse_httpx,
@@ -329,7 +360,7 @@ PARSERS: dict[str, Callable[[str], list[OutputItem]]] = {
     "dnsx": parse_dnsx,
     "assetfinder": parse_assetfinder,
     "amass": parse_amass,
-    "ffuf": parse_raw,    # ffuf has JSON; v1 keeps raw
+    "ffuf": parse_ffuf_jsonl,  # v0.4: real JSONL parser (was raw)
     "tlsx": parse_tlsx,
     "dalfox": parse_dalfox,
     "kxss": parse_kxss,

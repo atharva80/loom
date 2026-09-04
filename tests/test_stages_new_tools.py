@@ -101,6 +101,60 @@ class TestCommandBuilders:
         assert cmd == ["alterx", "-silent"]
 
 
+class TestWordlistResolution:
+    FFUF_JSONL = ('{"url": "https://example.com/admin", "status": 200, '
+                  '"length": 123, "words": 20, "input": {"FUZZ": "admin"}}')
+
+    def _fake_ffuf(self, tmp_path, monkeypatch):
+        import os
+        import stat as _stat
+        bindir = tmp_path / "ffufbin"
+        bindir.mkdir(exist_ok=True)
+        p = bindir / "ffuf"
+        p.write_text(f"#!/bin/sh\ncat <<'__OUT__'\n{self.FFUF_JSONL}\n__OUT__\nexit 0\n")
+        p.chmod(p.stat().st_mode | _stat.S_IEXEC)
+        monkeypatch.setenv("LOOM_TOOL_FFUF", str(p))
+        monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    def test_ffuf_wordlist_falls_back_to_existing(self, tmp_path, monkeypatch):
+        """Default wordlist path (/usr/share/wordlists/dirb/common.txt)
+        doesn't exist on every box; the stage must pick the first
+        candidate that exists on disk (SecLists etc.)."""
+        import asyncio
+        from loom import stages as st
+        self._fake_ffuf(tmp_path, monkeypatch)
+        fake_list = tmp_path / "common.txt"
+        fake_list.write_text("admin\n")
+        monkeypatch.setattr(st, "_FFUF_WORDLIST_CANDIDATES",
+                            (str(tmp_path / "missing.txt"), str(fake_list)))
+        runner = Runner(_scope(), workdir=tmp_path)
+        ctx = PipelineContext(scope=runner.scope)
+        ctx.extras["urls"] = ["https://example.com/"]
+        items = asyncio.run(st.make_ffuf_stage()(runner, "example.com", ctx))
+        assert len(items) == 1
+        assert items[0].kind == "finding"
+        assert items[0].value == "https://example.com/admin"
+
+    def test_ffuf_wordlist_missing_dir_creates_one(self, tmp_path, monkeypatch):
+        """No candidate exists → stage writes a minimal built-in
+        wordlist into the workdir instead of ffuf failing on a
+        nonexistent -w path."""
+        import asyncio
+        from loom import stages as st
+        self._fake_ffuf(tmp_path, monkeypatch)
+        monkeypatch.setattr(st, "_FFUF_WORDLIST_CANDIDATES",
+                            (str(tmp_path / "nope.txt"),))
+        runner = Runner(_scope(), workdir=tmp_path)
+        ctx = PipelineContext(scope=runner.scope)
+        ctx.extras["urls"] = ["https://example.com/"]
+        items = asyncio.run(st.make_ffuf_stage()(runner, "example.com", ctx))
+        assert len(items) == 1
+        # Runner workdir is None in tests → falls back to ctx.workdir
+        # (tmp_path here), so the mini wordlist is written there.
+        mini = tmp_path / "inputs" / "example.com" / "mini-wordlist.txt"
+        assert mini.is_file()
+
+
 # ============================================================
 # Fake-binary integration tests
 # ============================================================
@@ -136,6 +190,7 @@ def fake_bin_dir(tmp_path: Path, monkeypatch) -> Path:
     _make("hakrawler", "https://example.com/found1\nhttps://example.com/found2.js")
     _make("subjack", "[+] Found dangling CNAME on example.com -> s3.amazonaws.com")
     _make("alterx", "stage.example.com\napi-stage.example.com")
+    _make("ffuf", '{"url": "https://example.com/admin", "status": 200, "length": 123, "words": 20, "input": {"FUZZ": "admin"}}')
 
     old_path = os.environ.get("PATH", "")
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{old_path}")
@@ -228,6 +283,35 @@ class TestNewStages:
         items = await make_alterx_stage()(runner, "example.com", ctx)
         assert all(i.kind == "subdomain" for i in items)
         assert "api-stage.example.com" in ctx.extras["subdomains"]
+
+    async def test_alterx_caps_permutations(self, tmp_path, monkeypatch):
+        """Live-verified bug (2026-09-04): uncapped alterx generated
+        109k perms from 190 subs and starved dnsx. The -limit flag must
+        be in the argv, defaulting to 5000."""
+        # Wire a fake alterx + fake Runner workdir so output files
+        # land in tmp_path deterministically.
+        from pathlib import Path as _P
+        import stat as _stat
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        p = bindir / "alterx"
+        p.write_text("#!/bin/sh\ncat <<'__OUT__'\na.example.com\n__OUT__\nexit 0\n")
+        p.chmod(p.stat().st_mode | _stat.S_IEXEC)
+        monkeypatch.setenv("LOOM_TOOL_ALTERX", str(p))
+        monkeypatch.setenv("PATH", f"{bindir}{os.environ.get('PATH','')}")
+
+        runner = Runner(_scope(), workdir=tmp_path)
+        ctx = PipelineContext(scope=runner.scope)
+        ctx.extras["subdomains"] = ["stage.example.com"]
+        await make_alterx_stage(max_perms=42)(runner, "example.com", ctx)
+        outdir = _P(tmp_path) / "permute" / "example.com"
+        cmds = sorted(outdir.glob("alterx*.cmd.txt"))
+        assert cmds, f"no cmd file written under {outdir}"
+        import json as _json
+        meta = _json.loads(cmds[-1].read_text())
+        assert "-limit" in meta["cmd"]
+        idx = meta["cmd"].index("-limit")
+        assert meta["cmd"][idx + 1] == "42"
 
 
 # ============================================================

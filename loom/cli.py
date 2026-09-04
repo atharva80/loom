@@ -972,6 +972,91 @@ def cmd_validate(args: argparse.Namespace) -> int:
 # ============================================================
 
 
+def cmd_findings(args: argparse.Namespace) -> int:
+    """Aggregate findings across all runs in a workdir.
+
+    Reads every run-*/events.jsonl, keeps finding/takeover events,
+    dedupes on (value, source), severity-sorts, prints a report or
+    --json.
+    """
+    workdir = Path(args.workdir).expanduser()
+    if not workdir.exists():
+        print(f"workdir {workdir} does not exist", file=sys.stderr)
+        return 1
+    db_path = workdir / "loom.sqlite"
+    if not db_path.exists():
+        print("no runs found (no loom.sqlite)", file=sys.stderr)
+        return 1
+
+    run_domains: dict[int, str] = {}
+    with State(db_path) as st:
+        for r in st.list_runs():
+            run_domains[r["id"]] = r.get("domain") or "?"
+
+    sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    merged: dict[tuple[str, str], dict] = {}
+    for ev_file in sorted(workdir.glob("run-*/events.jsonl")):
+        try:
+            run_id = int(ev_file.parent.name.split("-", 1)[1])
+        except ValueError:
+            continue
+        try:
+            lines = ev_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = ev.get("type")
+            if etype not in ("finding", "takeover"):
+                continue
+            src = ev.get("source") or "?"
+            key = (str(ev.get("value")), src)
+            runs = ev.setdefault("evidence", {}).setdefault("runs", [])
+            if run_id not in runs:
+                runs.append(run_id)
+            prev = merged.get(key)
+            if prev is None:
+                sev = (ev.get("evidence", {}).get("severity") or "").lower()
+                if etype == "takeover":
+                    sev = sev or "high"
+                ev["severity"] = sev or "info"
+                ev["host"] = ev.get("host") or "?"
+                merged[key] = ev
+            else:
+                # keep the richer severity across duplicates
+                if ev.get("evidence", {}).get("severity", "") \
+                        not in (None, "", "info"):
+                    prev["severity"] = ev["evidence"]["severity"].lower()
+
+    if not merged:
+        print("no findings recorded yet", file=sys.stderr)
+        return 1
+
+    rows = sorted(merged.values(),
+                  key=lambda e: (sev_order.get(e["severity"], 9),
+                                 str(e.get("host", "")), str(e.get("value"))))
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2, default=str))
+        return 0
+
+    print(f"loom findings — {len(rows)} unique "
+          f"(from runs {min(run_domains) if run_domains else '-'}.."
+          f"{max(run_domains) if run_domains else '-'})")
+    print(f"  {'sev':<8} {'source':<10} {'host':<28} value")
+    for ev in rows:
+        runs = ",".join(map(str, ev["evidence"].get("runs", [])))
+        kind = (ev["evidence"].get("template_id")
+                or ev["evidence"].get("vuln")
+                or ev.get("type", "finding"))
+        print(f"  {ev['severity']:<8} {str(ev.get('source'))[:10]:<10} "
+              f"{str(ev.get('host'))[:28]:<28} {ev['value']}  "
+              f"[{kind}] runs={runs}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="loom",
@@ -1043,6 +1128,13 @@ def build_parser() -> argparse.ArgumentParser:
     # validate
     pv = sub.add_parser("validate", help="check that recon tools are installed")
     pv.set_defaults(func=cmd_validate)
+
+    # findings — cross-run aggregated findings report
+    pf = sub.add_parser("findings",
+                        help="aggregate findings across all runs (severity-sorted)")
+    pf.add_argument("--json", action="store_true",
+                    help="emit findings as a JSON array")
+    pf.set_defaults(func=cmd_findings)
 
     # status-server — minimal live run-status web page
     pss = sub.add_parser("status-server",

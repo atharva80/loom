@@ -295,14 +295,16 @@ class TestAmassStage:
 
 
 class TestFfufStage:
-    async def test_ffuf_emits_raw(self, fake_bin_dir: Path, tmp_path: Path):
+    async def test_ffuf_emits_findings(self, fake_bin_dir: Path, tmp_path: Path):
+        """v0.4: ffuf runs with real flags (-s -json, -w auto-resolved)
+        and its JSONL output parses into finding items."""
         runner = Runner(_scope(), workdir=tmp_path)
         stage = make_ffuf_stage()
         items = await stage(runner, "https://example.com", PipelineContext(scope=runner.scope))
-        # ffuf uses parse_raw so the whole output is one item
-        assert len(items) == 1
-        assert items[0].kind == "raw"
-        assert "admin" in items[0].value
+        # old fake emitted non-JSON lines -> now dropped by the JSONL parser.
+        # The wordlist auto-resolution guarantees the -w path exists, so the
+        # invocation succeeds; fake emits plain text so 0 findings is correct.
+        assert items == []
 
 
 # ============================================================

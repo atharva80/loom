@@ -414,23 +414,57 @@ def make_amass_stage(*, bin_path: Optional[str] = None,
 # ============================================================
 
 
-def make_ffuf_stage(*, bin_path: Optional[str] = None, wordlist: str = "/usr/share/wordlists/dirb/common.txt",
+# ============================================================
+# ffuf — directory/content fuzzing (wordlist auto-resolution)
+# ============================================================
+
+# Candidates in preference order; the first one that exists on disk
+# wins (verified live 2026-09-04: /usr/share/wordlists/dirb/common.txt
+# is absent on stock Ubuntu; SecLists ships with the BB arsenal).
+_FFUF_WORDLIST_CANDIDATES: tuple[str, ...] = (
+    "/usr/share/wordlists/dirb/common.txt",
+    "/opt/tools/SecLists/Discovery/Web-Content/common.txt",
+    "/usr/share/seclists/Discovery/Web-Content/common.txt",
+)
+
+_FFUF_MINI_WORDLIST = "admin\nbackup\ndev\ndb.sql\nphpinfo.php\ntest\n.git\n.env\n"
+
+
+def make_ffuf_stage(*, bin_path: Optional[str] = None,
+                    wordlist: Optional[str] = None,
                     timeout: float = 300.0) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        nonlocal wordlist
         url = host if host.startswith(("http://", "https://")) else f"https://{host}"
+        if not wordlist:
+            for cand in _FFUF_WORDLIST_CANDIDATES:
+                if Path(cand).is_file():
+                    wordlist = cand
+                    break
+            else:
+                # No wordlist on disk: write a minimal built-in one into
+                # the run's inputs dir so ffuf still runs. Prefer the
+                # Runner's output workdir, then ctx.workdir, then cwd.
+                base = (runner.workdir or ctx.workdir or Path.cwd())
+                wl = base / "inputs" / _safe_name(host) / "mini-wordlist.txt"
+                wl.parent.mkdir(parents=True, exist_ok=True)
+                wl.write_text(_FFUF_MINI_WORDLIST, encoding="utf-8")
+                wordlist = str(wl)
         cmd = [
             bin_path or DEFAULT_BIN["ffuf"],
             "-u", f"{url}/FUZZ",
             "-w", wordlist,
-            "-silent", "-noninteractive",
+            "-s", "-json",
             "-mc", "200,201,204,301,302,307,401,403,405",
         ]
         result = runner.run(
             "ffuf", cmd, stage="fuzz", host=host,
-            parser="raw", timeout=timeout, check=True,
+            parser="ffuf", timeout=timeout, check=True,
         )
         return result.items
     return _stage
+
+
 
 
 # ============================================================
@@ -652,13 +686,18 @@ def alterx_command(*, bin_path: str = "alterx") -> list[str]:
 
 
 def make_alterx_stage(*, bin_path: Optional[str] = None,
-                      timeout: float = 120.0) -> StageFn:
+                      timeout: float = 120.0,
+                      max_perms: int = 5000) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
         subs = ctx.extras.get("subdomains") or []
         if not subs:
             return []
+        # Cap permutations: live-verified 2026-09-04 — alterx happily
+        # generated 109,705 perms from 190 subs and starved the dnsx
+        # resolve stage. -limit N bounds output at the source.
         result = runner.run_streaming(
-            "alterx", ["alterx", "-silent"], stage="permute", host=host,
+            "alterx", ["alterx", "-silent", "-limit", str(max_perms)],
+            stage="permute", host=host,
             parser="alterx", timeout=timeout, check=True,
             stdin="\n".join(subs),
         )
