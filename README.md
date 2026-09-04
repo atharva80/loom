@@ -46,8 +46,10 @@ loom validate
 
 # Single-host pipelines
 loom run example.com --pipeline catchall              # classify (1 stage, ~2s)
-loom run example.com --pipeline subdomain             # subenum → resolve → probe → vulnscan
-loom run example.com --pipeline web                   # catchall → crawl → scan
+loom run example.com --pipeline subdomain             # subenum → resolve → probe → vulnscan (+ urls)
+loom run example.com --pipeline web                   # catchall → katana ∥ hakrawler → scan
+loom run example.com --pipeline full                  # subenum → resolve → probe ∥ urls → xss fanout ∥ scan
+loom run example.com --pipeline deep                  # full + portscan, tls-SAN, uncover, permute, takeover, fuzz
 
 # Multi-host fanout (drive hundreds of subs in parallel)
 loom run example.com --pipeline multiweb \
@@ -61,8 +63,13 @@ loom run example.com --pipeline multiweb --from-eventlog 1
 # HackerOne program scope (mixed asset types, eligibility flags, OO denials)
 loom run api.twilio.com --h1-scope project/twilio/scope.csv --pipeline web
 
-# Overnight multi-scope sweep from a CSV
+# Overnight multi-scope sweep from a CSV (per-scope table, non-zero exit on failure)
 loom run x --scopes-file scopes.csv --workdir ~/bbdata
+loom sweeps --scopes-file scopes.csv --workdir ~/bbdata   # cron-friendly wrapper
+
+# Aggregate findings across all runs in a workdir (severity-sorted)
+loom findings --workdir ~/bbdata
+loom findings --workdir ~/bbdata --json
 
 # Watch it live (separate terminal)
 loom status-server --workdir ~/bbdata --port 8080
@@ -218,6 +225,9 @@ fan-out of nuclei can't blow past 20GB.
 - External tools: `subfinder`, `httpx`, `nuclei`, `katana`, `dnsx`, `naabu`,
   `ffuf`, `gau`, `waybackurls`, `assetfinder`, `amass` (any missing tool is
   non-fatal — `loom validate` reports what's available)
+- Optional (used by the `full`/`deep` pipelines): `uncover`, `tlsx`,
+  `dalfox`, `crlfuzz`, `kxss`, `hakrawler`, `subjack`, `alterx`
+  (missing optional tools are skipped or gated by the preflight check)
 
 ---
 
