@@ -71,6 +71,10 @@ loom sweeps --scopes-file scopes.csv --workdir ~/bbdata   # cron-friendly wrappe
 loom findings --workdir ~/bbdata
 loom findings --workdir ~/bbdata --json
 
+# What changed between two runs (overnight triage)
+loom diff --workdir ~/bbdata --json                    # newest two runs
+loom diff --workdir ~/bbdata --from 1 --to 2 --types finding,subdomain
+
 # Wordlists (AssetNote, tech-gated fuzz — see loom/wordlists.py)
 # setup once: download from https://wordlists.assetnote.io/data/*.json
 # manifests into /opt/tools/wordlists/assetnote, then create the stable

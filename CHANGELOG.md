@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.8.7 — 2026-09-05
+
+Overnight path repaired: sweeps ran zero scopes + wrong workdir.
+
+- **The incident** (first sweeps live-fire under v0.8): both scopes
+  crashed instantly (`AttributeError: scope`, rc=2) — `cmd_sweeps`
+  clones its argv for `_run_one` but the sweeps parser lacks
+  run-only flags. Worse, the crash hid a second bug: the sweeps-level
+  `--workdir` default clobbered the global, so the run silently
+  landed in `~/.local/share/loom` (7 stray runs; removed, user's
+  run-1 untouched).
+- **The fixes**: child namespace filled with run-parser defaults
+  (`scope/mode/subdomains/from_eventlog`); sweeps `--workdir` is now
+  `argparse.SUPPRESS` with a fallback, so global order works and
+  subcommand-level still overrides.
+- **Proof**: strict child-namespace + workdir-precedence tests (the
+  old table-output test passed on crashed rows — loose asserts kept);
+  live 2-scope sweep verified landing in the requested workdir.
+
 ## v0.8.6 — 2026-09-05
 
 Vulnscan gate widened (third and last probe-only gate).

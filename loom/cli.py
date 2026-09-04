@@ -1207,6 +1207,10 @@ def cmd_sweeps(args: argparse.Namespace) -> int:
     """
     from .scopecsv import parse_scopes_csv
     scopes_file = Path(args.scopes_file).expanduser()
+    # --workdir is argparse.SUPPRESS on this subparser so an explicit
+    # global --workdir survives (a subparser default would clobber it).
+    if getattr(args, "workdir", None) is None:
+        args.workdir = str(DEFAULT_WORKDIR)
     if not scopes_file.exists():
         print(f"scopes file not found: {scopes_file}", file=sys.stderr)
         return 1
@@ -1223,6 +1227,13 @@ def cmd_sweeps(args: argparse.Namespace) -> int:
         child.pipeline = entry.pipeline
         child.max_concurrency = entry.max_concurrency
         child.scopes_file = None
+        # The sweeps parser lacks run-only flags; _run_one touches all
+        # of these (live 2026-09-05: missing `scope` crashed every
+        # scope with AttributeError). Fill run-parser defaults.
+        child.scope = getattr(args, "scope", "default")
+        child.mode = getattr(args, "mode", "recon")
+        child.subdomains = getattr(args, "subdomains", None)
+        child.from_eventlog = getattr(args, "from_eventlog", None)
         t0 = time.monotonic()
         try:
             child_rc = _run_one(child)
@@ -1410,8 +1421,8 @@ def build_parser() -> argparse.ArgumentParser:
                               "(wrapper over `run --scopes-file`)")
     psw.add_argument("--scopes-file", required=True,
                      help="CSV: domain[,pipeline[,concurrency]] per line")
-    psw.add_argument("--workdir", default=str(DEFAULT_WORKDIR),
-                     help=f"workdir (default: {DEFAULT_WORKDIR})")
+    psw.add_argument("--workdir", default=argparse.SUPPRESS,
+                     help="workdir (default: global --workdir)")
     psw.add_argument("--h1-username", default="drstrangexd",
                      help="HackerOne username for headers (default: drstrangexd)")
     psw.add_argument("--rate-limit", type=int, default=30,

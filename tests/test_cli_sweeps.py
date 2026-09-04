@@ -8,12 +8,12 @@ exit code reflecting failed-scope count.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
 from loom import cli
-
 
 @pytest.fixture
 def home_in_tmp(monkeypatch, tmp_path):
@@ -61,5 +61,61 @@ class TestSweepsCLI:
         code = cli.main(["--workdir", str(tmp_path), "sweeps",
                           "--scopes-file", str(csv), "--rate-limit", "1000"])
         out = capsys.readouterr().out
-        # Only one scope, not two
-        assert out.count("vulnweb.com") == 1
+        # Only one scope row, not two (comments/blank lines skipped).
+        # (Counts table rows, not bare mentions — a real run logs the
+        # domain on stage lines too.)
+        rows = re.findall(r"(?m)^\s*\d+\s+vulnweb\.com\s+\w+", out)
+        assert len(rows) == 1
+
+
+class TestSweepsChildNamespace:
+    """cmd_sweeps clones its argv into a `run`-shaped namespace for
+    _run_one. Every attr _run_one touches must exist — live 2026-09-05:
+    both scopes crashed with AttributeError (no `scope`) and rc=2,
+    while the old table-output test still passed on loose asserts."""
+
+    def test_child_namespace_satisfies_run_one(
+            self, home_in_tmp, tmp_path, monkeypatch, capsys):
+        csv = tmp_path / "scopes.csv"
+        csv.write_text("example.com,catchall,1\n")
+        seen = []
+        monkeypatch.setattr(cli, "_run_one", lambda child: seen.append(child) or 0)
+        code = cli.main(["--workdir", str(tmp_path), "sweeps",
+                         "--scopes-file", str(csv)])
+        assert code == 0
+        assert len(seen) == 1
+        child = seen[0]
+        for attr in ("domain", "pipeline", "scope", "mode", "workdir",
+                     "max_concurrency", "max_ram_gb", "scopes_file",
+                     "subdomains", "from_eventlog"):
+            assert hasattr(child, attr), f"child missing {attr!r}"
+        assert child.domain == "example.com"
+        assert child.pipeline == "catchall"
+        assert child.scopes_file is None
+
+    def test_global_workdir_survives_sweeps_subparser(
+            self, home_in_tmp, tmp_path, monkeypatch):
+        """Live 2026-09-05: `loom --workdir X sweeps` silently ran in
+        the default workdir — the subparser --workdir default clobbered
+        the global. The sweep landed 7 runs in ~/.local/share/loom."""
+        csv = tmp_path / "scopes.csv"
+        csv.write_text("example.com,catchall,1\n")
+        seen = []
+        monkeypatch.setattr(cli, "_run_one", lambda child: seen.append(child) or 0)
+        wd = tmp_path / "w"
+        code = cli.main(["--workdir", str(wd), "sweeps",
+                         "--scopes-file", str(csv)])
+        assert code == 0
+        assert seen[0].workdir == str(wd)
+
+    def test_sweeps_level_workdir_overrides_global(
+            self, home_in_tmp, tmp_path, monkeypatch):
+        csv = tmp_path / "scopes.csv"
+        csv.write_text("example.com,catchall,1\n")
+        seen = []
+        monkeypatch.setattr(cli, "_run_one", lambda child: seen.append(child) or 0)
+        wd = tmp_path / "w2"
+        code = cli.main(["sweeps", "--scopes-file", str(csv),
+                         "--workdir", str(wd)])
+        assert code == 0
+        assert seen[0].workdir == str(wd)
