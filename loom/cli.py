@@ -1197,6 +1197,39 @@ def cmd_diff(args: argparse.Namespace) -> int:
 # ============================================================
 
 
+def _run_one_timeout(child: argparse.Namespace, timeout_s: float) -> int:
+    """Run _run_one with a wall-clock cap (sweeps --timeout).
+
+    The scope runs in a daemon thread; on expiry the sweep moves on
+    with rc=124 (GNU timeout convention) while the orphan keeps its
+    own State connection and may still finish its rows late. Daemon
+    so a hung scope never blocks process exit.
+    """
+    import threading
+
+    box: dict = {}
+
+    def _target() -> None:
+        try:
+            box["rc"] = _run_one(child)
+        except SystemExit as e:
+            box["rc"] = int(e.code) if isinstance(e.code, int) else 2
+        except Exception as e:  # same defensive rule as the sweep loop
+            print(f"  scope {child.domain} crashed: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            box["rc"] = 2
+
+    t = threading.Thread(target=_target, daemon=True,
+                         name=f"loom-sweep-{child.domain}")
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        print(f"  scope {child.domain} exceeded --timeout {timeout_s:g}s; "
+              f"abandoned (rc=124), continuing sweep", file=sys.stderr)
+        return 124
+    return int(box.get("rc", 2))
+
+
 def cmd_sweeps(args: argparse.Namespace) -> int:
     """Overnight multi-scope orchestrator.
 
@@ -1221,6 +1254,7 @@ def cmd_sweeps(args: argparse.Namespace) -> int:
     print(f"loom sweeps — {len(entries)} scope(s) from {scopes_file}")
     print(f"  {'#':<3} {'domain':<28} {'pipeline':<10} {'conc':<4} result")
     rc = 0
+    scope_timeout = float(getattr(args, "timeout", 0) or 0)
     for i, entry in enumerate(entries, 1):
         child = argparse.Namespace(**vars(args))
         child.domain = entry.domain
@@ -1236,7 +1270,10 @@ def cmd_sweeps(args: argparse.Namespace) -> int:
         child.from_eventlog = getattr(args, "from_eventlog", None)
         t0 = time.monotonic()
         try:
-            child_rc = _run_one(child)
+            if scope_timeout > 0:
+                child_rc = _run_one_timeout(child, scope_timeout)
+            else:
+                child_rc = _run_one(child)
         except SystemExit as e:
             child_rc = int(e.code) if isinstance(e.code, int) else 2
         except Exception as e:  # defensive — never crash a sweep on one bad scope
@@ -1429,6 +1466,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="requests/sec cap for H1-program runs (default: 30)")
     psw.add_argument("--max-ram-gb", type=int, default=20,
                      help="per-run RAM budget cap in GB (default: 20)")
+    psw.add_argument("--timeout", type=float, default=0,
+                     help="per-scope wall-clock cap in seconds (default: 0 = off). "
+                          "An overrunning scope is abandoned (rc=124) and the "
+                          "sweep continues with the next scope.")
     psw.set_defaults(func=cmd_sweeps)
 
     # findings — cross-run aggregated findings report

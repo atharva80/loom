@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.8.8 — 2026-09-05
+
+Sweeps --timeout: one hung scope no longer stalls the night.
+
+- **The gap**: the sweeps docstring promised per-scope wall-clock
+  timeouts; none existed — a hung scope (tarpit burning every tool
+  budget) blocked all remaining scopes.
+- **The fix**: `sweeps --timeout SECONDS` (default 0 = off) runs each
+  scope in a daemon thread; on expiry the sweep advances with rc=124
+  (GNU timeout convention) and the orphan may still finish its rows
+  late on its own State connection. Non-zero scope count still drives
+  the exit code for cron.
+- **Proof**: `TestSweepsTimeout` — faked 30s hang + `--timeout 1`:
+  both scopes attempted in ~1s, second completes, rc=1, "124" logged.
+
 ## v0.8.7 — 2026-09-05
 
 Overnight path repaired: sweeps ran zero scopes + wrong workdir.

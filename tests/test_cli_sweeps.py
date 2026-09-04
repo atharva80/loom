@@ -119,3 +119,43 @@ class TestSweepsChildNamespace:
                          "--workdir", str(wd)])
         assert code == 0
         assert seen[0].workdir == str(wd)
+
+
+class TestSweepsTimeout:
+    """--timeout abandons hung scopes (rc=124) and continues the sweep."""
+
+    def test_hung_scope_abandoned_next_runs(
+            self, home_in_tmp, tmp_path, monkeypatch, capsys):
+        import time
+        csv = tmp_path / "scopes.csv"
+        csv.write_text("slow.example.com,catchall,1\nfast.example.com,catchall,1\n")
+        calls = []
+
+        def fake_run_one(child):
+            calls.append(child.domain)
+            if child.domain.startswith("slow"):
+                time.sleep(30)
+            return 0
+
+        monkeypatch.setattr(cli, "_run_one", fake_run_one)
+        t0 = time.monotonic()
+        code = cli.main(["--workdir", str(tmp_path), "sweeps",
+                         "--scopes-file", str(csv), "--timeout", "1"])
+        dt = time.monotonic() - t0
+        assert code == 1  # one scope non-zero
+        assert calls == ["slow.example.com", "fast.example.com"]
+        assert dt < 15, f"sweep waited out the hung scope ({dt:.1f}s)"
+        err = capsys.readouterr().err
+        assert "124" in err
+
+    def test_no_timeout_runs_straight_through(
+            self, home_in_tmp, tmp_path, monkeypatch):
+        csv = tmp_path / "scopes.csv"
+        csv.write_text("a.example.com,catchall,1\nb.example.com,catchall,1\n")
+        calls = []
+        monkeypatch.setattr(
+            cli, "_run_one", lambda child: calls.append(child.domain) or 0)
+        code = cli.main(["--workdir", str(tmp_path), "sweeps",
+                         "--scopes-file", str(csv)])
+        assert code == 0
+        assert calls == ["a.example.com", "b.example.com"]
