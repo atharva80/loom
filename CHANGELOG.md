@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.8.3 — 2026-09-05
+
+Timeouts kill the whole process tree (group-kill).
+
+- **The incident** (deep sweep triage): dalfox's 600s timeout escaped
+  as a traceback-carrying stage failure — and measurement showed why
+  timeouts hurt twice: grandchildren (dalfox→chrome, `sh`→`sleep`)
+  inherit the stdout/stderr pipes, so post-kill `communicate()` /
+  stderr-drain blocks until THEY exit. A 1s timeout took 47s; orphans
+  then ate RAM through the rest of the sweep.
+- **The fix** (`loom/runner.py`): both spawns use
+  `start_new_session=True`; both timeout paths call the new
+  `_kill_tree()` (killpg SIGKILL + fallback kill). uncover-without-keys
+  triaged as correctly-handled (fast fail, structured error naming the
+  missing keys — no change).
+- **Proof** (`tests/test_proctree.py`): streaming timeouts return a
+  timed-out `RunResult` (never raise); `run()` + `run_streaming()`
+  with `sleep N & wait` grandchildren finish in ~1s with zero
+  survivors (`pgrep` clean). Suite timeout tests: 105s → 2.6s.
+
 ## v0.8.2 — 2026-09-05
 
 Contract-doc accuracy: LOOM_OUTPUTS.md now matches behavior, enforced by tests.

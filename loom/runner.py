@@ -80,6 +80,27 @@ def _classify_error(exit_code: int, stderr: str, timed_out: bool = False) -> Opt
     return f"exit code {exit_code}: {tail}"
 
 
+def _kill_tree(proc: "asyncio.subprocess.Process") -> None:
+    """SIGKILL a timed-out tool AND its children.
+
+    Live 2026-09-05: dalfox spawns headless-chrome grandchildren that
+    inherit the stdout/stderr pipes. `proc.kill()` alone leaves them
+    alive — post-kill `communicate()`/stderr-drain then blocks until
+    the grandchildren exit on their own (measured: 1s timeout took
+    47s), and the orphans eat RAM through the rest of the sweep.
+    Spawns use start_new_session=True so killpg hits exactly this
+    tool's group and nothing else.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 @dataclass
 class RunResult:
     tool: str
@@ -788,6 +809,10 @@ class Runner:
                        if stdin is not None else None),
                 cwd=cwd,
                 env=env,
+                # Own process group so timeouts can SIGKILL the whole
+                # tree (see _kill_tree) — tools spawn children that
+                # inherit our pipes.
+                start_new_session=True,
             )
         except FileNotFoundError as e:
             duration = time.monotonic() - t0
@@ -813,10 +838,7 @@ class Runner:
             error = _classify_error(exit_code, stderr, timed_out)
         except asyncio.TimeoutError:
             duration = time.monotonic() - t0
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+            _kill_tree(proc)
             try:
                 out_b, err_b = await proc.communicate()
             except Exception:
@@ -964,6 +986,10 @@ class Runner:
                        if stdin is not None else None),
                 cwd=cwd,
                 env=env,
+                # Own process group so timeouts can SIGKILL the whole
+                # tree (see _kill_tree) — tools spawn children that
+                # inherit our pipes.
+                start_new_session=True,
             )
         except FileNotFoundError as e:
             err = f"binary not found: {e}"
@@ -1058,10 +1084,7 @@ class Runner:
                         on_item(item)
         finally:
             if stream_timed_out:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+                _kill_tree(proc)
             if feed_task is not None:
                 try:
                     await asyncio.wait_for(feed_task, timeout=10)
