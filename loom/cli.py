@@ -610,7 +610,13 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
         ))
         dag.add(Node(
             id="scan", inputs={"url"}, depends_on=["probe", "urls", "urls_gau"],
-            should_run=lambda s: s.from_node("probe", "url") > 0,
+            # Pool gate (not probe-only): nuclei consumes scan_pool ←
+            # extras["urls"] ← probe+urls+urls_gau. Live 2026-09-05: probe
+            # yielded 0 while passive sources held 15k urls and scan
+            # skipped the whole run.
+            should_run=lambda s: (s.from_node("urls", "url")
+                                  + s.from_node("urls_gau", "url")
+                                  + s.from_node("probe", "url")) > 0,
         ))
         dag.add(Node(
             id="screenshot", depends_on=["probe"],
@@ -727,7 +733,10 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
         ))
         dag.add(Node(
             id="scan", inputs={"url"}, depends_on=["probe", "urls", "urls_gau", "params", "jssecrets"],
-            should_run=lambda s: s.from_node("probe", "url") > 0,
+            # Pool gate (not probe-only): see full pipeline above.
+            should_run=lambda s: (s.from_node("urls", "url")
+                                  + s.from_node("urls_gau", "url")
+                                  + s.from_node("probe", "url")) > 0,
         ))
         dag.add(Node(
             id="screenshot", depends_on=["probe"],

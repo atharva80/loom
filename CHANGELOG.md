@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.8.4 — 2026-09-05
+
+Scan gate widened to the URL pool (nuclei no longer sits out).
+
+- **The incident** (deep-sweep findings audit): all 85 findings were
+  gitleaks-on-JS-mirror; nuclei ran zero times. `scan`/`screenshot`
+  gated only on probe urls, but probe yielded 0 (tarpitted apex)
+  while wayback/gau held 15,161 urls — the flagship scanner skipped
+  the entire run although its stage consumes exactly that pool
+  (`scan_pool ← extras["urls"]`, fed by probe+urls+urls_gau).
+- **The fix**: `scan` predicate in `full` + `deep` is now the pool
+  gate `(urls+urls_gau+probe) > 0`, identical to the xss nodes.
+  `screenshot` stays probe-gated (needs live hosts; dead wayback
+  urls would just burn chrome launches).
+- **Proof** (`tests/test_scan_pool_gate.py`): predicate unit tests
+  for both pipelines (passive-only → run, probe-only → run, empty →
+  skip) plus an end-to-end mini-pipeline running the REAL deep scan
+  predicate — passive urls flow, probe empty, scan executes done.
+
 ## v0.8.3 — 2026-09-05
 
 Timeouts kill the whole process tree (group-kill).
