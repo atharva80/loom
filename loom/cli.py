@@ -23,6 +23,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -972,6 +973,50 @@ def cmd_validate(args: argparse.Namespace) -> int:
 # ============================================================
 
 
+def cmd_sweeps(args: argparse.Namespace) -> int:
+    """Overnight multi-scope orchestrator.
+
+    A friendlier wrapper over `loom run --scopes-file` for cron/overseer
+    scripts. Iterates each scope in the CSV sequentially, prints a
+    compact summary table, and exits with the count of failed scopes
+    (capped at 1) so a non-zero exit surfaces problems.
+    """
+    from .scopecsv import parse_scopes_csv
+    scopes_file = Path(args.scopes_file).expanduser()
+    if not scopes_file.exists():
+        print(f"scopes file not found: {scopes_file}", file=sys.stderr)
+        return 1
+    entries = parse_scopes_csv(scopes_file)
+    if not entries:
+        print(f"no scopes found in {scopes_file}", file=sys.stderr)
+        return 1
+    print(f"loom sweeps — {len(entries)} scope(s) from {scopes_file}")
+    print(f"  {'#':<3} {'domain':<28} {'pipeline':<10} {'conc':<4} result")
+    rc = 0
+    for i, entry in enumerate(entries, 1):
+        child = argparse.Namespace(**vars(args))
+        child.domain = entry.domain
+        child.pipeline = entry.pipeline
+        child.max_concurrency = entry.max_concurrency
+        child.scopes_file = None
+        t0 = time.monotonic()
+        try:
+            child_rc = _run_one(child)
+        except SystemExit as e:
+            child_rc = int(e.code) if isinstance(e.code, int) else 2
+        except Exception as e:  # defensive — never crash a sweep on one bad scope
+            print(f"  [{i}/{len(entries)}] {entry.domain} crashed: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            child_rc = 2
+        dt = time.monotonic() - t0
+        status = "ok" if child_rc == 0 else f"rc={child_rc}"
+        print(f"  {i:<3} {entry.domain:<28} {entry.pipeline:<10} "
+              f"{entry.max_concurrency:<4} {status}  ({dt:.1f}s)")
+        if child_rc != 0:
+            rc = 1
+    return rc
+
+
 def cmd_findings(args: argparse.Namespace) -> int:
     """Aggregate findings across all runs in a workdir.
 
@@ -1128,6 +1173,22 @@ def build_parser() -> argparse.ArgumentParser:
     # validate
     pv = sub.add_parser("validate", help="check that recon tools are installed")
     pv.set_defaults(func=cmd_validate)
+
+    # sweeps — overnight multi-scope wrapper
+    psw = sub.add_parser("sweeps",
+                         help="run a multi-scope overnight sweep "
+                              "(wrapper over `run --scopes-file`)")
+    psw.add_argument("--scopes-file", required=True,
+                     help="CSV: domain[,pipeline[,concurrency]] per line")
+    psw.add_argument("--workdir", default=str(DEFAULT_WORKDIR),
+                     help=f"workdir (default: {DEFAULT_WORKDIR})")
+    psw.add_argument("--h1-username", default="drstrangexd",
+                     help="HackerOne username for headers (default: drstrangexd)")
+    psw.add_argument("--rate-limit", type=int, default=30,
+                     help="requests/sec cap for H1-program runs (default: 30)")
+    psw.add_argument("--max-ram-gb", type=int, default=20,
+                     help="per-run RAM budget cap in GB (default: 20)")
+    psw.set_defaults(func=cmd_sweeps)
 
     # findings — cross-run aggregated findings report
     pf = sub.add_parser("findings",
