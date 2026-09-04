@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.7.0 — 2026-09-05
+
+Agent-grade outputs: every read command speaks JSON, every run leaves
+a manifest, and the output contract is written down.
+
+### New features
+
+- **run manifest** (`loom/manifest.py`): `run-<id>/manifest.json`
+  with identity, timing, per-stage outcomes, event counts, the run
+  summary, loom version, and resolved tool paths. Built purely from
+  state DB + eventlog (no subprocesses, never raises). Written
+  automatically by `run`, `resume` (both paths), and every `sweeps`
+  scope.
+- **`--json` everywhere**: `status`, `list-runs`, `validate` join
+  `findings`. One JSON document on stdout, diagnostics on stderr.
+- **`LOOM_OUTPUTS.md`**: the machine-readable contract — layout,
+  crash-safety notes, all 12 artifact kinds with evidence fields,
+  severity + status vocabularies (including the documented
+  done/finished legacy split), manifest schema, exit codes, dedup key.
+
+### Robustness notes
+
+- EventLog's open-write-close per append is SIGKILL-safe by
+  construction (verified by reading, not changed).
+- Resume's skip gate keys on pipeline-level `(host, node, node)`
+  marks — covered by a hermetic offline test (seed → resume →
+  manifest, zero network, 0.78s).
+
 ## v0.6.1 — 2026-09-05
 
 AssetNote wordlists: tech-gated fuzzing, arjun params, amass brute.

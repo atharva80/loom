@@ -112,6 +112,21 @@ def _print_stats(state: State, run_id: int, workdir: Optional[Path] = None) -> N
               f"timeout={timeout:<3} running={running}")
 
 
+def _write_run_manifest(workdir, run_id: int, log=None) -> None:
+    """Write run-<id>/manifest.json (best-effort, never raises — a
+    manifest must never break a run)."""
+    try:
+        from .manifest import write_manifest
+        path = write_manifest(workdir, run_id)
+    except Exception:
+        return
+    if path is not None and log is not None:
+        try:
+            log.info(f"manifest: {path}")
+        except Exception:
+            pass
+
+
 def await_loop(coro_factory, *args, **kwargs):
     """Run an async coroutine to completion from a sync context.
     Centralizes the asyncio.run() pattern used in cmd_run / cmd_resume."""
@@ -293,6 +308,7 @@ def _run_one(args: argparse.Namespace) -> int:
             log.info(f"  state     : {db_path}")
             log.info(f"  log       : {log.log_path}")
             st.finish_run(run_id)
+            _write_run_manifest(workdir, run_id, log)
             log.close()
             return 0
 
@@ -322,6 +338,7 @@ def _run_one(args: argparse.Namespace) -> int:
         log.info(f"  log   : {log.log_path}")
         log.info(f"  outputs: {outputs_dir}/<stage>/<host>/<tool>.*")
         st.finish_run(run_id)
+        _write_run_manifest(workdir, run_id, log)
         log.close()
     return 0
 
@@ -885,6 +902,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
             log.info(f"  workdir: {run_dir}")
             log.info(f"  log    : {log.log_path}")
             st.finish_run(target_run)
+            _write_run_manifest(workdir, target_run, log)
             log.close()
             return 0
 
@@ -909,6 +927,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         log.info(f"  workdir: {run_dir}")
         log.info(f"  log    : {log.log_path}")
         st.finish_run(target_run)
+        _write_run_manifest(workdir, target_run, log)
         log.close()
     return 0
 
@@ -939,6 +958,10 @@ def cmd_status(args: argparse.Namespace) -> int:
                 return 1
         else:
             run_id = runs[0]["id"]
+        if getattr(args, "json", False):
+            print(json.dumps(st.run_summary(run_id, workdir=workdir),
+                             indent=2, default=str))
+            return 0
         _print_stats(st, run_id, workdir=workdir)
     return 0
 
@@ -950,18 +973,27 @@ def cmd_list_runs(args: argparse.Namespace) -> int:
         print("(no runs yet)")
         return 0
     any_found = False
+    rows_out: list[dict] = []
     with State(db_path) as st:
         runs = st.list_runs(domain=args.domain)
         for r in runs:
             any_found = True
             finished = r.get("finished_at")
             status = "done" if finished else "inflight"
+            if getattr(args, "json", False):
+                row = dict(r)
+                row["status"] = status
+                rows_out.append(row)
+                continue
             pipeline = r.get("pipeline") or "-"
             hosts = r.get("hosts_json")
             hosts_n = f"{len(json.loads(hosts))} hosts" if hosts else ""
             print(f"run {r['id']:<4} {status:<10} domain={r['domain']:<20} "
                   f"pipeline={pipeline:<10} {hosts_n:<12} "
                   f"mode={r.get('mode')}  scope={r.get('scope_profile')}")
+    if getattr(args, "json", False):
+        print(json.dumps(rows_out, indent=2, default=str))
+        return 0
     if not any_found:
         print("(no runs yet)")
     return 0
@@ -998,7 +1030,22 @@ EXPECTED_TOOLS = {
 
 def cmd_validate(args: argparse.Namespace) -> int:
     from .tools import validate_report
+    from .wordlists import EXPECTED_WORDLISTS, wordlist_dir, wordlist_status
     report = validate_report()
+    present, wmissing = wordlist_status()
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "tools": [
+                {"tool": tool, "status": status, "path": path, "note": note}
+                for tool, status, path, note in report
+            ],
+            "wordlists": {
+                "dir": str(wordlist_dir()),
+                "present": present,
+                "missing": wmissing,
+            },
+        }, indent=2, default=str))
+        return 0 if not any(s == "missing" for _, s, _, _ in report) else 1
     missing: list[str] = []
     shadowed: int = 0
     print(f"loom {__version__} — tool check")
@@ -1018,8 +1065,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
           + (f", {shadowed} shadowed" if shadowed else ""))
 
     # Wordlists (AssetNote etc.) — advisory only, never fail the check.
-    from .wordlists import EXPECTED_WORDLISTS, wordlist_dir, wordlist_status
-    present, wmissing = wordlist_status()
     print()
     print(f"loom wordlists — {wordlist_dir()} ({len(present)}/{len(EXPECTED_WORDLISTS)} present)")
     for fname, _purpose in EXPECTED_WORDLISTS:
@@ -1226,15 +1271,21 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("domain", help="target domain")
     ps.add_argument("--run", type=int, default=None,
                     help="specific run id (default: newest)")
+    ps.add_argument("--json", action="store_true",
+                    help="emit the run summary as JSON (agent-readable)")
     ps.set_defaults(func=cmd_status)
 
     # list-runs
     pl = sub.add_parser("list-runs", help="list all runs")
     pl.add_argument("--domain", help="filter by domain")
+    pl.add_argument("--json", action="store_true",
+                    help="emit runs as a JSON array (agent-readable)")
     pl.set_defaults(func=cmd_list_runs)
 
     # validate
     pv = sub.add_parser("validate", help="check that recon tools are installed")
+    pv.add_argument("--json", action="store_true",
+                    help="emit tool/wordlist status as JSON (agent-readable)")
     pv.set_defaults(func=cmd_validate)
 
     # sweeps — overnight multi-scope wrapper
