@@ -24,9 +24,10 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import urllib.request
 from pathlib import Path
 from typing import Optional
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urljoin, urlsplit
 
 from .pipeline import PipelineContext, StageFn
 from .runner import OutputItem, Runner, _safe_host as _safe_name
@@ -55,6 +56,10 @@ DEFAULT_BIN = {
     "subjack": "subjack",
     "alterx": "alterx",
     "gowitness": "gowitness",
+    "arjun": "arjun",
+    "gitleaks": "gitleaks",
+    "jsluice": "jsluice",
+    "asnmap": "asnmap",
 }
 
 
@@ -994,4 +999,258 @@ def make_gowitness_stage(*, bin_path: Optional[str] = None,
                        evidence={"source": "gowitness", "host": host})
             for p in _screenshots_in(shot_dir)
         ]
+    return _stage
+
+
+# ============================================================
+# arjun — hidden HTTP parameter discovery (feeds the XSS fanout)
+# ============================================================
+
+_ARJUN_UA = "Mozilla/5.0 (X11; Linux x86_64) loom/1.0"
+
+
+def arjun_command(url: str, out_file: Path | str, *,
+                  bin_path: str = "arjun",
+                  threads: int = 10,
+                  req_timeout: int = 10) -> list[str]:
+    """arjun -u <url> -oT <textfile> (GET lines are full URLs).
+
+    Verified against the bundled source (exporter.py): -oT writes one
+    URL per line for GET; `<url>\\t<query>` for POST-found params.
+    """
+    return [
+        bin_path, "-u", url, "-oT", str(out_file),
+        "-t", str(threads), "-T", str(req_timeout),
+        "-m", "GET", "-q",
+    ]
+
+
+def make_arjun_stage(*, bin_path: Optional[str] = None,
+                     timeout: float = 300.0,
+                     max_urls: int = 10,
+                     threads: int = 10) -> StageFn:
+    async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        # Arjun is request-heavy (~1k+ reqs/URL): feed it normalized
+        # PARAMLESS representatives only — parameterized pages already
+        # feed dalfox directly, and variants would re-test identically.
+        from .runner import parse_arjun as _parse_arjun
+        host = _bare_host(host)
+        reps, _ = normalize_urls(ctx.extras.get("urls") or [])
+        targets = [u for u in reps if "?" not in u][:max_urls]
+        if not targets:
+            return []
+        tdir = Path(runner.workdir or ctx.workdir or Path.cwd()) / "inputs" / _safe_name(host)
+        tdir.mkdir(parents=True, exist_ok=True)
+        (tdir / "arjun-targets.txt").write_text("\n".join(targets), encoding="utf-8")
+        items: list[OutputItem] = []
+        for i, target in enumerate(targets):
+            out = tdir / f"arjun-{i}.txt"
+            cmd = arjun_command(
+                target, out, bin_path=bin_path or DEFAULT_BIN["arjun"],
+                threads=threads)
+            result = runner.run(
+                "arjun", cmd, stage="params", host=host,
+                parser="raw", timeout=timeout, check=True,
+            )
+            # Parse the -oT file (not stdout — arjun's stdout is
+            # progress noise; the file is the contract).
+            try:
+                found = _parse_arjun(out.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                found = []
+            items.extend(found)
+            _ = result
+        # Share discoveries: parameterized hits join urls_params (the
+        # pool dalfox/kxss read first) AND the raw urls pool.
+        urls = ctx.extras.setdefault("urls", [])
+        params = ctx.extras.setdefault("urls_params", [])
+        for it in items:
+            if it.kind == "url":
+                if it.value not in urls:
+                    urls.append(it.value)
+                if "?" in it.value and it.value not in params:
+                    params.append(it.value)
+        return items
+    return _stage
+
+
+# ============================================================
+# jssecrets — JS download → gitleaks + jsluice (secrets + endpoints)
+# ============================================================
+
+
+def _fetch_js(urls: list[str], dest_dir: Path, *,
+              max_files: int = 30,
+              max_bytes: int = 1_000_000,
+              timeout: float = 10.0) -> list[tuple[str, Path]]:
+    """Download JS bodies with stdlib (bounded count + size).
+
+    Dumb capped fetcher by design: downloads exactly what's listed
+    (extension filtering is the caller's job). Skips non-http(s),
+    oversize bodies, HTML responses, and all errors silently.
+    Returns [(source_url, local_path)].
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    got: list[tuple[str, Path]] = []
+    for i, u in enumerate(urls):
+        if len(got) >= max_files:
+            break
+        try:
+            p = urlsplit(u)
+            if p.scheme not in ("http", "https") or not p.netloc:
+                continue
+            req = urllib.request.Request(
+                u, headers={"User-Agent": _ARJUN_UA})
+            with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310
+                if int(r.headers.get("Content-Length") or 0) > max_bytes:
+                    continue
+                body = r.read(max_bytes + 1)
+                if len(body) > max_bytes:
+                    continue
+                if "html" in (r.headers.get("Content-Type") or "").lower():
+                    continue
+        except Exception:
+            continue
+        dest = dest_dir / f"{i:03d}_{_safe_name(u)[-80:]}.js"
+        try:
+            dest.write_bytes(body)
+        except OSError:
+            continue
+        got.append((u, dest))
+    return got
+
+
+def make_jssecrets_stage(*, bin_path: Optional[str] = None,
+                         gitleaks_bin: Optional[str] = None,
+                         jsluice_bin: Optional[str] = None,
+                         timeout: float = 300.0,
+                         max_js: int = 30) -> StageFn:
+    async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        from .runner import (
+            parse_gitleaks as _parse_gitleaks,
+            parse_jsluice_secrets as _parse_secrets,
+            parse_jsluice_urls as _parse_urls,
+        )
+        host = _bare_host(host)
+        # Caller-side extension filter: only .js URLs from the pool.
+        js_urls = [u for u in (ctx.extras.get("urls") or [])
+                   if urlsplit(u).path.lower().endswith(".js")][:max_js]
+        if not js_urls:
+            return []
+        base = Path(runner.workdir or ctx.workdir or Path.cwd())
+        jsdir = base / "inputs" / _safe_name(host) / "js"
+        fetched = _fetch_js(js_urls, jsdir)
+        if not fetched:
+            return []
+        files = [str(p) for _, p in fetched]
+
+        items: list[OutputItem] = []
+        # 1. gitleaks over the directory (exit-code forced 0: leaks
+        #    are findings, not failures).
+        gl = runner.run(
+            "gitleaks",
+            [gitleaks_bin or DEFAULT_BIN["gitleaks"], "detect",
+             "--source", str(jsdir), "--no-git",
+             "-f", "json", "-r", "-", "--exit-code", "0", "--no-color"],
+            stage="jssecrets", host=host,
+            parser="gitleaks", timeout=timeout, check=True,
+        )
+        items.extend(gl.items)
+        # 2. jsluice endpoint mining → back into the pools. Per-FILE
+        #    invocations (not one batch): each file's finds resolve
+        #    against THAT file's origin — batching would orphan every
+        #    relative URL (the most common jsluice output).
+        urls = ctx.extras.setdefault("urls", [])
+        params = ctx.extras.setdefault("urls_params", [])
+        for src_url, path in fetched:
+            ju = runner.run_streaming(
+                "jsluice",
+                [jsluice_bin or DEFAULT_BIN["jsluice"], "urls", str(path)],
+                stage="jssecrets", host=host,
+                parser="jsluice_urls", timeout=timeout, check=True,
+            )
+            for it in ju.items:
+                abs_url = _resolve_js_url(it.value, src_url)
+                if not abs_url:
+                    continue
+                if abs_url not in urls:
+                    urls.append(abs_url)
+                    items.append(OutputItem(kind="url", value=abs_url,
+                                            evidence={"source": "jsluice"}))
+                if "?" in abs_url and abs_url not in params:
+                    params.append(abs_url)
+        # 3. jsluice secret mining → findings.
+        js = runner.run_streaming(
+            "jsluice",
+            [jsluice_bin or DEFAULT_BIN["jsluice"], "secrets", *files],
+            stage="jssecrets", host=host,
+            parser="jsluice_secrets", timeout=timeout, check=True,
+        )
+        items.extend(js.items)
+        # gitleaks items were already extended above (findings flow to
+        # the eventlog via the parser — single-emitter rule intact).
+        return items
+    return _stage
+
+
+def _resolve_js_url(found: str, src_url: str) -> Optional[str]:
+    """Resolve a jsluice-found URL against its source file's URL.
+
+    Absolute URLs pass through; root-/page-relative ones join against
+    the JS file's own URL (urljoin). Returns None for values that
+    aren't usable URLs. Pure helper.
+    """
+    found = (found or "").strip()
+    if not found:
+        return None
+    if found.startswith(("http://", "https://")):
+        return found
+    if found.startswith(("data:", "javascript:", "mailto:", "#")):
+        return None
+    try:
+        joined = urljoin(src_url, found)
+        p = urlsplit(joined)
+    except ValueError:
+        return None
+    if p.scheme not in ("http", "https") or not p.netloc:
+        return None
+    return joined
+
+
+# ============================================================
+# asnmap — ASN/CIDR harvest (record-only; scope safety first)
+# ============================================================
+
+
+def _pdcp_key_configured() -> bool:
+    """True when an asnmap-usable PDCP key exists (env or config dir)."""
+    if os.environ.get("PDCP_API_KEY"):
+        return True
+    return (Path.home() / ".config" / "pdcp").exists()
+
+
+def asnmap_command(domain: str, *, bin_path: str = "asnmap",
+                   timeout: float = 60.0) -> list[str]:
+    """asnmap -d <domain> -silent -json -duc (no update check)."""
+    return [bin_path, "-d", domain, "-silent", "-json", "-duc"]
+
+
+def make_asnmap_stage(*, bin_path: Optional[str] = None,
+                      timeout: float = 60.0) -> StageFn:
+    async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        # No key → clean skip (no invocation, no failure). A key-gated
+        # node that FAILED would cry wolf on every keyless run.
+        if not _pdcp_key_configured():
+            return []
+        host = _bare_host(host)
+        cmd = asnmap_command(host, bin_path=bin_path or DEFAULT_BIN["asnmap"],
+                             timeout=timeout)
+        result = runner.run(
+            "asnmap", cmd, stage="asn", host=host,
+            parser="asnmap", timeout=timeout, check=True,
+        )
+        # RECORD-ONLY by design: discovered CIDRs are NOT auto-fed into
+        # portscan. Scanning netblocks most programs didn't authorize
+        # would exceed scope — the analyst expands explicitly.
+        return result.items
     return _stage

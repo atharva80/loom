@@ -49,7 +49,7 @@ loom run example.com --pipeline catchall              # classify (1 stage, ~2s)
 loom run example.com --pipeline subdomain             # subenum → resolve → probe → vulnscan (+ urls)
 loom run example.com --pipeline web                   # catchall → katana ∥ hakrawler → scan
 loom run example.com --pipeline full                  # subenum → resolve → probe ∥ urls → xss fanout ∥ scan ∥ screenshots
-loom run example.com --pipeline deep                  # full + portscan, tls-SAN, uncover, permute, takeover, fuzz
+loom run example.com --pipeline deep                  # full + portscan, tls-SAN, uncover, permute, takeover, fuzz, params, jssecrets, asn
 
 # Multi-host fanout (drive hundreds of subs in parallel)
 loom run example.com --pipeline multiweb \
@@ -230,6 +230,10 @@ fan-out of nuclei can't blow past 20GB.
   `gowitness` (missing optional tools are skipped or gated by the
   preflight check; gowitness needs a Chrome binary — Playwright's
   bundled chromium is auto-detected, override with LOOM_CHROME_PATH)
+- Tier-2 (`deep` only): `arjun` (hidden params; lives in
+  `~/.local/bin`, resolved via fallback), `gitleaks` + `jsluice`
+  (JS secret/endpoint mining), `asnmap` (ASN harvest — needs a free
+  PDCP_API_KEY, cleanly skipped without one)
 
 ---
 

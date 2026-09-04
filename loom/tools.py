@@ -43,6 +43,8 @@ GO_BIN_DIRS: tuple[Path, ...] = tuple(
             os.environ.get("GOBIN", ""),
             os.path.join(os.environ.get("GOPATH", str(Path.home() / "go")), "bin"),
             str(Path.home() / "go" / "bin"),
+            # pipx / pip --user binaries (arjun lives here). Added v0.6.
+            str(Path.home() / ".local" / "bin"),
             "/usr/local/go/bin",
             "/usr/local/bin",
         )

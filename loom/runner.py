@@ -338,6 +338,173 @@ def parse_subjack(stdout: str) -> list[OutputItem]:
     return items
 
 
+def parse_arjun(stdout: str) -> list[OutputItem]:
+    """Arjun -oT text export: one URL per line (GET), or
+    `<url>\\t<query>` for POST-found params.
+
+    GET lines become url items directly. POST lines keep the method +
+    param names in evidence (dalfox pipe only speaks GET, but the
+    endpoint + params are still discovery value).
+    """
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        url, _, rest = s.partition("\t")
+        url = url.strip()
+        if not _URL_RE.match(url):
+            continue
+        if rest.strip():
+            params = rest.strip()
+            items.append(OutputItem(
+                kind="url", value=url,
+                evidence={"source": "arjun", "method": "POST",
+                          "params": params}))
+        else:
+            items.append(OutputItem(
+                kind="url", value=url,
+                evidence={"source": "arjun", "method": "GET"}))
+    return items
+
+
+def parse_gitleaks(stdout: str) -> list[OutputItem]:
+    """gitleaks `-f json` report: a JSON ARRAY of findings.
+
+    No severity field upstream — verified credential-shape matches
+    are high-signal, so severity=high (documented, not inflated:
+    gitleaks only fires on strong rules + entropy).
+    """
+    try:
+        data = json.loads(stdout.strip() or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    items: list[OutputItem] = []
+    for f in data:
+        if not isinstance(f, dict):
+            continue
+        secret = str(f.get("Secret") or f.get("Match") or "")[:200]
+        if not secret:
+            continue
+        items.append(OutputItem(
+            kind="finding",
+            value=f"{f.get('File', '?')}:{f.get('StartLine', '?')}",
+            evidence={
+                "source": "gitleaks",
+                "vuln": "exposed-secret",
+                "rule": f.get("RuleID"),
+                "severity": "high",
+                "secret_redacted": secret[:4] + "...",
+                "description": f.get("Description"),
+            },
+        ))
+    return items
+
+
+def parse_jsluice_urls(stdout: str) -> list[OutputItem]:
+    """jsluice `urls` mode: JSONL {url, queryParams, method, ...}.
+
+    Relative URLs pass through unresolved (the stage joins them
+    against the JS file's origin — the parser stays pure).
+    """
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        url = obj.get("url")
+        if not url or not isinstance(url, str):
+            continue
+        items.append(OutputItem(
+            kind="url", value=url,
+            evidence={
+                "source": "jsluice",
+                "method": obj.get("method") or "GET",
+                "params": obj.get("queryParams") or [],
+                "js_type": obj.get("type"),
+            },
+        ))
+    return items
+
+
+def parse_jsluice_secrets(stdout: str) -> list[OutputItem]:
+    """jsluice `secrets` mode: JSONL {kind, data, severity, ...}.
+
+    Tool severity kept as-is; missing → medium (a secret-shaped match
+    with no confidence signal deserves eyes, not the top slot).
+    """
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        kind = obj.get("kind")
+        if not kind:
+            continue
+        items.append(OutputItem(
+            kind="finding",
+            value=f"{obj.get('filename', '?')}:{kind}",
+            evidence={
+                "source": "jsluice",
+                "vuln": str(kind),
+                "severity": str(obj.get("severity") or "medium").lower(),
+                "data": obj.get("data"),
+            },
+        ))
+    return items
+
+
+def parse_asnmap(stdout: str) -> list[OutputItem]:
+    """asnmap -json output, parsed leniently.
+
+    The exact schema can't be verified without a PDCP key (none on
+    this box), so every plausible key is tried (asn/as_number,
+    prefixes/cidr/ranges) and anything unrecognized is skipped —
+    never raises. stdout.txt always preserves the raw output for
+    re-parsing later.
+    """
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        src = obj.get("input") or obj.get("host") or ""
+        asn = obj.get("asn") or obj.get("as_number") or obj.get("as-number")
+        if asn:
+            items.append(OutputItem(
+                kind="asn", value=str(asn),
+                evidence={"source": "asnmap", "input": src,
+                          "as_name": obj.get("as_name") or obj.get("org")}))
+        cidrs: list = []
+        for key in ("prefixes", "cidr", "cidrs", "ranges", "prefix"):
+            v = obj.get(key)
+            if isinstance(v, str):
+                cidrs.append(v)
+            elif isinstance(v, list):
+                cidrs.extend(str(x) for x in v if isinstance(x, str))
+        for c in dict.fromkeys(cidrs):
+            items.append(OutputItem(
+                kind="cidr", value=c,
+                evidence={"source": "asnmap", "input": src, "asn": asn}))
+    return items
+
+
 def parse_ffuf_jsonl(stdout: str) -> list[OutputItem]:
     """ffuf -json output: newline-delimited JSON records.
 
@@ -396,6 +563,11 @@ PARSERS: dict[str, Callable[[str], list[OutputItem]]] = {
     "amass": parse_amass,
     "ffuf": parse_ffuf_jsonl,  # v0.4: real JSONL parser (was raw)
     "subjack": parse_subjack,  # v0.5: [+] lines → takeover items (was raw)
+    "arjun": parse_arjun,
+    "gitleaks": parse_gitleaks,
+    "jsluice_urls": parse_jsluice_urls,
+    "jsluice_secrets": parse_jsluice_secrets,
+    "asnmap": parse_asnmap,
     "tlsx": parse_tlsx,
     "dalfox": parse_dalfox,
     "kxss": parse_kxss,

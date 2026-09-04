@@ -395,11 +395,12 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
     from .stages import (
         make_assetfinder_stage, make_dnsx_stage, make_httpx_stage,
         make_katana_stage, make_nuclei_stage, make_subfinder_stage,
-        make_alterx_stage, make_crlfuzz_stage, make_dalfox_stage,
+        make_alterx_stage, make_arjun_stage, make_asnmap_stage,
+        make_crlfuzz_stage, make_dalfox_stage,
         make_ffuf_stage, make_gau_stage, make_gowitness_stage,
-        make_hakrawler_stage, make_kxss_stage, make_naabu_stage,
-        make_subjack_stage, make_tlsx_stage, make_uncover_stage,
-        make_waybackurls_stage,
+        make_hakrawler_stage, make_jssecrets_stage, make_kxss_stage,
+        make_naabu_stage, make_subjack_stage,
+        make_tlsx_stage, make_uncover_stage, make_waybackurls_stage,
     )
     from .live import LiveLogger
     from .pipeline import StageFn
@@ -660,18 +661,18 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
         ))
         dag.add(Node(
-            id="xss", depends_on=["probe", "urls", "urls_gau"],
+            id="xss", depends_on=["probe", "urls", "urls_gau", "params", "jssecrets"],
             should_run=lambda s: (s.from_node("urls", "url")
                                   + s.from_node("urls_gau", "url")
                                   + s.from_node("probe", "url")) > 0,
         ))
         dag.add(Node(
-            id="xss_kxss", depends_on=["probe", "urls", "urls_gau"],
+            id="xss_kxss", depends_on=["probe", "urls", "urls_gau", "params", "jssecrets"],
             should_run=lambda s: (s.from_node("urls", "url")
                                   + s.from_node("urls_gau", "url")) > 0,
         ))
         dag.add(Node(
-            id="xss_crlfuzz", depends_on=["probe", "urls", "urls_gau"],
+            id="xss_crlfuzz", depends_on=["probe", "urls", "urls_gau", "params", "jssecrets"],
             should_run=lambda s: (s.from_node("urls", "url")
                                   + s.from_node("urls_gau", "url")) > 0,
         ))
@@ -679,12 +680,31 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             id="takeover", depends_on=["resolve", "tls"],
             should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
         ))
+        # v0.6 Tier-2: hidden-param discovery + JS secret mining run a
+        # level BEFORE the xss/scan fanout, so dalfox and nuclei consume
+        # their output in the SAME run (archive → arjun/jsluice →
+        # dalfox/nuclei). ASN harvest is record-only (never auto-scans
+        # CIDRs — scope safety).
+        dag.add(Node(
+            id="params", depends_on=["urls", "urls_gau"],
+            should_run=lambda s: (s.from_node("urls", "url")
+                                  + s.from_node("urls_gau", "url")) > 0,
+        ))
+        dag.add(Node(
+            id="jssecrets", depends_on=["urls", "urls_gau"],
+            should_run=lambda s: (s.from_node("urls", "url")
+                                  + s.from_node("urls_gau", "url")) > 0,
+        ))
+        dag.add(Node(
+            id="asn", depends_on=["resolve"],
+            should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
+        ))
         dag.add(Node(
             id="fuzz", depends_on=["probe"],
             should_run=lambda s: s.from_node("probe", "url") > 0,
         ))
         dag.add(Node(
-            id="scan", inputs={"url"}, depends_on=["probe", "urls", "urls_gau"],
+            id="scan", inputs={"url"}, depends_on=["probe", "urls", "urls_gau", "params", "jssecrets"],
             should_run=lambda s: s.from_node("probe", "url") > 0,
         ))
         dag.add(Node(
@@ -709,6 +729,9 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             "fuzz": make_ffuf_stage(),
             "scan": make_nuclei_stage(),
             "screenshot": make_gowitness_stage(),
+            "params": make_arjun_stage(),
+            "jssecrets": make_jssecrets_stage(),
+            "asn": make_asnmap_stage(),
         }
         return dag, stages
 
@@ -959,6 +982,10 @@ EXPECTED_TOOLS = {
     "hakrawler": "web crawling (JS-aware)",
     "subjack": "subdomain takeover checks",
     "alterx": "subdomain permutation generation",
+    "arjun": "hidden HTTP parameter discovery",
+    "gitleaks": "secret scanning",
+    "jsluice": "JS endpoint/secret extraction",
+    "asnmap": "ASN/CIDR harvest (needs PDCP key)",
     "gowitness": "screenshotting",
 }
 

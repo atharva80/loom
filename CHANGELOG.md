@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.6.0 — 2026-09-05
+
+Tier-2 pass: hidden-parameter discovery, JS secret mining, ASN
+harvest. Same rule as v0.5: raw pools append-only, stages only shape
+tool inputs; discovered artifacts flow back into the pools so no
+finding class is ever orphaned.
+
+### New features
+
+- **Arjun hidden-param discovery** (`params` node, `deep` only — it's
+  request-heavy): normalized paramless reps → `arjun -u -oT -t 10`,
+  discoveries join `urls_params` (which dalfox/kxss read first) AND
+  `urls`. Runs a level before the xss/scan fanout so dalfox and
+  nuclei consume its output same-run. `~/.local/bin` added to binary
+  fallback dirs (pipx/pip-user tools live there).
+- **JS secret mining** (`jssecrets` node, `deep`): downloads crawled
+  `.js` (stdlib, 30-file/1MB caps) → gitleaks (`high` findings) +
+  jsluice `urls` (endpoints resolved against their file's origin back
+  into the pools — per-file invocations so relative URLs never
+  orphan) + jsluice `secrets` (tool severity kept, default medium).
+- **ASN harvest** (`asn` node, `deep`): `asnmap -d -silent -json`,
+  RECORD-ONLY — CIDRs are never auto-fed to portscan (scanning
+  unauthorized netblocks would exceed scope). Key-gated: clean skip
+  with no PDCP key (no invocation, no failure).
+- **`loom validate`** covers arjun/gitleaks/jsluice/asnmap.
+
+### Decisions (stated, not silent)
+
+- **rustscan skipped**: no cargo on the box, GitHub API unreachable
+  for release binaries — and naabu `-top-ports full` already covers
+  the full-range capability with zero new deps.
+- **sqlmap not wired**: slow/noisy by default; XSS/CRLF fanout +
+  nuclei cover the injection surface. Revisit as an opt-in node.
+
 ## v0.5.0 — 2026-09-05
 
 Tier-1 optimization pass: same coverage in a fraction of the requests,
