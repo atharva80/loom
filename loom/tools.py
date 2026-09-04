@@ -106,9 +106,21 @@ def resolve_tool(tool: str) -> Optional[str]:
             key = f"{tool}|{env_override}"
             _validate_cache[key] = env_override
             return env_override
+        # PATH precedence stays intact for non-shadowers (tests rely on
+        # it) — but a which() MISS must fall back to the known Go bin
+        # dirs. Bug found live 2026-09-04: tools installed in ~/go/bin
+        # but absent from PATH resolved to None.
         which = shutil.which(tool)
-        _validate_cache[tool] = which or ""
-        return which
+        if which:
+            _validate_cache[tool] = which
+            return which
+        for d in GO_BIN_DIRS:
+            p = d / tool
+            if p.is_file() and os.access(p, os.X_OK):
+                _validate_cache[tool] = str(p)
+                return str(p)
+        _validate_cache[tool] = ""
+        return None
 
     candidates: list[str] = []
 

@@ -381,17 +381,51 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
     v0.2 pipelines:
       - catchall : 1 stage (catchall detect). Cheapest; works anywhere.
       - subdomain: subenum (subfinder+assetfinder) → resolve (dnsx)
-                   → probe (httpx) → screenshot (skipped unless probed)
-      - web      : catchall → katana → nuclei (will be skipped on
-                   clean hosts if no URLs produced)
+                   → probe (httpx) → vulnscan (nuclei)
+                   v0.4: += urls (waybackurls + gau)
+      - web      : catchall → katana (+ hakrawler) → nuclei
+      - multi    : per-host probe. - multiweb: per-host catchall → probe → nuclei
+    v0.4 pipelines:
+      - full     : subenum → resolve → probe → urls → xss → scan
+      - deep     : full + portscan + permute → resolve + tls + uncover
+                   + takeover (subjack) + fuzz (ffuf)
     """
     from .dag import DAG, Node
     from .stages import (
         make_assetfinder_stage, make_dnsx_stage, make_httpx_stage,
         make_katana_stage, make_nuclei_stage, make_subfinder_stage,
+        make_alterx_stage, make_crlfuzz_stage, make_dalfox_stage,
+        make_ffuf_stage, make_gau_stage, make_hakrawler_stage,
+        make_kxss_stage, make_naabu_stage, make_subjack_stage,
+        make_tlsx_stage, make_uncover_stage, make_waybackurls_stage,
     )
     from .live import LiveLogger
     from .pipeline import StageFn
+
+    # Required-tool gate: refuse runs whose pipeline has unresolvable
+    # tools (live-verified exit 127s mid-DAG are worse than a clean
+    # pre-flight refusal).
+    REQUIRED_TOOLS: dict[str, set[str]] = {
+        "catchall": set(),
+        "multi": {"httpx"},
+        "multiweb": {"httpx"},
+        "subdomain": {"subfinder", "assetfinder", "dnsx", "httpx"},
+        "web": {"httpx", "nuclei"},
+        "full": {"subfinder", "assetfinder", "dnsx", "httpx",
+                 "waybackurls", "gau"},
+        "deep": {"subfinder", "assetfinder", "dnsx", "httpx",
+                 "waybackurls", "gau", "naabu"},
+    }
+    _ = runner_cls  # historical signature; stages resolve their own binaries
+    from .tools import resolve_tool
+    missing = sorted(
+        t for t in REQUIRED_TOOLS.get(name, set()) if resolve_tool(t) is None
+    )
+    if missing:
+        print(f"error: pipeline {name!r} missing required tools: "
+              f"{', '.join(missing)} — install them or run 'loom validate'",
+              file=sys.stderr)
+        sys.exit(2)
 
     if name == "catchall":
         dag = DAG()
@@ -414,6 +448,16 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             depends_on=["resolve"],
             should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
         ))
+        # v0.4: historical URLs (waybackurls + gau) — cheap passive OSINT
+        # on the target domain, in parallel with the probe stage.
+        dag.add(Node(
+            id="urls", depends_on=["resolve"],
+            should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
+        ))
+        dag.add(Node(
+            id="urls_gau", depends_on=["resolve"],
+            should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
+        ))
         dag.add(Node(
             id="vulnscan", inputs={"url"}, depends_on=["probe"],
             should_run=lambda s: s.from_node("probe", "url") > 0,
@@ -423,6 +467,8 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             "subenum_assetfinder": make_assetfinder_stage(),
             "resolve": make_dnsx_stage(),
             "probe": make_httpx_stage(),
+            "urls": make_waybackurls_stage(),
+            "urls_gau": make_gau_stage(),
             "vulnscan": make_nuclei_stage(),
         }
         return dag, stages
@@ -435,14 +481,22 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             depends_on=["catchall"],
             should_run=lambda s: s.from_node("catchall", "catchall_result") > 0,
         ))
+        # v0.4: hakrawler as a second crawler in parallel with katana.
+        dag.add(Node(
+            id="hakrawler", inputs={"catchall_result"},
+            depends_on=["catchall"],
+            should_run=lambda s: s.from_node("catchall", "catchall_result") > 0,
+        ))
         dag.add(Node(
             id="nuclei", inputs={"subdomain", "url"},
-            depends_on=["katana"],
-            should_run=lambda s: s.from_node("katana", "url") > 0,
+            depends_on=["katana", "hakrawler"],
+            should_run=lambda s: (s.from_node("katana", "url")
+                                  + s.from_node("hakrawler", "url")) > 0,
         ))
         stages = {
             "catchall": _make_catchall_stage(log, catchall_mod),
             "katana": make_katana_stage(),
+            "hakrawler": make_hakrawler_stage(),
             "nuclei": make_nuclei_stage(),
         }
         return dag, stages
@@ -480,6 +534,162 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             "catchall": _make_catchall_stage(log, catchall_mod),
             "probe": make_httpx_stage(),
             "nuclei": make_nuclei_stage(),
+        }
+        return dag, stages
+
+    if name == "full":
+        # v0.4: the complete passive+active recon chain on one domain.
+        #   [1] subenum (subfinder ∥ assetfinder)
+        #   [2] resolve (dnsx over the pooled subs)
+        #   [3] probe (httpx) ∥ urls (waybackurls ∥ gau)
+        #   [4] xss fan-out (dalfox ∥ kxss ∥ crlfuzz) ∥ scan (nuclei)
+        dag = DAG()
+        dag.add(Node(id="subenum_subfinder", outputs={"subdomain"}))
+        dag.add(Node(id="subenum_assetfinder", outputs={"subdomain"}))
+        dag.add(Node(
+            id="resolve", inputs={"subdomain"},
+            depends_on=["subenum_subfinder", "subenum_assetfinder"],
+            should_run=lambda s: (s.from_node("subenum_subfinder", "subdomain")
+                                  + s.from_node("subenum_assetfinder", "subdomain")) > 0,
+        ))
+        dag.add(Node(
+            id="probe", inputs={"subdomain"}, outputs={"url"},
+            depends_on=["resolve"],
+            should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
+        ))
+        dag.add(Node(
+            id="urls", depends_on=["probe"],
+            should_run=lambda s: s.from_node("probe", "url") > 0,
+        ))
+        dag.add(Node(
+            id="urls_gau", depends_on=["probe"],
+            should_run=lambda s: s.from_node("probe", "url") > 0,
+        ))
+        dag.add(Node(
+            id="xss", depends_on=["urls", "urls_gau"],
+            should_run=lambda s: (s.from_node("urls", "url")
+                                  + s.from_node("urls_gau", "url")
+                                  + s.from_node("probe", "url")) > 0,
+        ))
+        dag.add(Node(
+            id="xss_kxss", depends_on=["urls", "urls_gau"],
+            should_run=lambda s: (s.from_node("urls", "url")
+                                  + s.from_node("urls_gau", "url")) > 0,
+        ))
+        dag.add(Node(
+            id="xss_crlfuzz", depends_on=["urls", "urls_gau"],
+            should_run=lambda s: (s.from_node("urls", "url")
+                                  + s.from_node("urls_gau", "url")) > 0,
+        ))
+        dag.add(Node(
+            id="scan", inputs={"url"}, depends_on=["probe", "urls", "urls_gau"],
+            should_run=lambda s: s.from_node("probe", "url") > 0,
+        ))
+        stages = {
+            "subenum_subfinder": make_subfinder_stage(),
+            "subenum_assetfinder": make_assetfinder_stage(),
+            "resolve": make_dnsx_stage(),
+            "probe": make_httpx_stage(),
+            "urls": make_waybackurls_stage(),
+            "urls_gau": make_gau_stage(),
+            "xss": make_dalfox_stage(),
+            "xss_kxss": make_kxss_stage(),
+            "xss_crlfuzz": make_crlfuzz_stage(),
+            "scan": make_nuclei_stage(),
+        }
+        return dag, stages
+
+    if name == "deep":
+        # v0.4: full + infrastructure. Adds port scanning (naabu),
+        # TLS SAN harvesting, search-engine asset discovery (uncover),
+        # subdomain permutations (alterx → dnsx re-resolve), takeover
+        # checks (subjack) and directory fuzzing (ffuf).
+        dag = DAG()
+        dag.add(Node(id="subenum_subfinder", outputs={"subdomain"}))
+        dag.add(Node(id="subenum_assetfinder", outputs={"subdomain"}))
+        dag.add(Node(id="subenum_uncover", outputs={"subdomain"}))
+        dag.add(Node(
+            id="permute", inputs={"subdomain"},
+            depends_on=["subenum_subfinder", "subenum_assetfinder",
+                        "subenum_uncover"],
+            should_run=lambda s: (s.from_node("subenum_subfinder", "subdomain")
+                                  + s.from_node("subenum_assetfinder", "subdomain")
+                                  + s.from_node("subenum_uncover", "subdomain")) > 0,
+        ))
+        dag.add(Node(
+            id="resolve", inputs={"subdomain"},
+            depends_on=["permute"],
+            should_run=lambda s: s.from_node("permute", "subdomain") > 0
+            or (s.from_node("subenum_subfinder", "subdomain")
+                + s.from_node("subenum_assetfinder", "subdomain")
+                + s.from_node("subenum_uncover", "subdomain")) > 0,
+        ))
+        dag.add(Node(
+            id="tls", depends_on=["resolve"],
+            should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
+        ))
+        dag.add(Node(
+            id="portscan", depends_on=["resolve"],
+            should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
+        ))
+        dag.add(Node(
+            id="probe", inputs={"subdomain"}, outputs={"url"},
+            depends_on=["resolve", "tls"],
+            should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
+        ))
+        dag.add(Node(
+            id="urls", depends_on=["probe"],
+            should_run=lambda s: s.from_node("probe", "url") > 0,
+        ))
+        dag.add(Node(
+            id="urls_gau", depends_on=["probe"],
+            should_run=lambda s: s.from_node("probe", "url") > 0,
+        ))
+        dag.add(Node(
+            id="xss", depends_on=["urls", "urls_gau"],
+            should_run=lambda s: (s.from_node("urls", "url")
+                                  + s.from_node("urls_gau", "url")
+                                  + s.from_node("probe", "url")) > 0,
+        ))
+        dag.add(Node(
+            id="xss_kxss", depends_on=["urls", "urls_gau"],
+            should_run=lambda s: (s.from_node("urls", "url")
+                                  + s.from_node("urls_gau", "url")) > 0,
+        ))
+        dag.add(Node(
+            id="xss_crlfuzz", depends_on=["urls", "urls_gau"],
+            should_run=lambda s: (s.from_node("urls", "url")
+                                  + s.from_node("urls_gau", "url")) > 0,
+        ))
+        dag.add(Node(
+            id="takeover", depends_on=["resolve", "tls"],
+            should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
+        ))
+        dag.add(Node(
+            id="fuzz", depends_on=["probe"],
+            should_run=lambda s: s.from_node("probe", "url") > 0,
+        ))
+        dag.add(Node(
+            id="scan", inputs={"url"}, depends_on=["probe", "urls", "urls_gau"],
+            should_run=lambda s: s.from_node("probe", "url") > 0,
+        ))
+        stages = {
+            "subenum_subfinder": make_subfinder_stage(),
+            "subenum_assetfinder": make_assetfinder_stage(),
+            "subenum_uncover": make_uncover_stage(),
+            "permute": make_alterx_stage(),
+            "resolve": make_dnsx_stage(),
+            "tls": make_tlsx_stage(),
+            "portscan": make_naabu_stage(),
+            "probe": make_httpx_stage(),
+            "urls": make_waybackurls_stage(),
+            "urls_gau": make_gau_stage(),
+            "xss": make_dalfox_stage(),
+            "xss_kxss": make_kxss_stage(),
+            "xss_crlfuzz": make_crlfuzz_stage(),
+            "takeover": make_subjack_stage(),
+            "fuzz": make_ffuf_stage(),
+            "scan": make_nuclei_stage(),
         }
         return dag, stages
 
@@ -722,6 +932,14 @@ EXPECTED_TOOLS = {
     "waybackurls": "wayback URL fetcher",
     "assetfinder": "subdomain enumeration",
     "amass": "attack surface mapping",
+    "uncover": "exposed-asset discovery (search engines)",
+    "tlsx": "TLS SAN/CN harvesting",
+    "dalfox": "XSS scanning",
+    "crlfuzz": "CRLF injection scanning",
+    "kxss": "reflected-parameter detection",
+    "hakrawler": "web crawling (JS-aware)",
+    "subjack": "subdomain takeover checks",
+    "alterx": "subdomain permutation generation",
     "gowitness": "screenshotting",
 }
 
@@ -772,8 +990,11 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--mode", default="recon",
                     help="run mode (recon, fast, deep)")
     pr.add_argument("--pipeline", default="catchall",
-                    choices=["catchall", "subdomain", "web", "multi", "multiweb"],
-                    help="pipeline to run (default: catchall)")
+                    choices=["catchall", "subdomain", "web", "multi", "multiweb",
+                             "full", "deep"],
+                    help="pipeline to run (default: catchall). 'full' = enum+"
+                         "resolve+probe+urls+xss+nuclei; 'deep' = full + ports, "
+                         "TLS SAN, uncover, permute, takeover, fuzz")
     pr.add_argument("--subdomains", default=None,
                     help="path to a file with one subdomain per line; "
                          "used by 'multi' pipeline to drive per-host fanout")

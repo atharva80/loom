@@ -109,6 +109,38 @@ class TestResolveTool:
         monkeypatch.delenv("LOOM_TOOL_NOTAREALTOOL", raising=False)
         assert tools.resolve_tool("definitely-not-a-real-tool-xyz") is None
 
+    def test_path_miss_falls_back_to_go_bins(self, fake_bins, monkeypatch):
+        """Bug found live 2026-09-04: non-shadower tools installed in
+        ~/go/bin but absent from PATH resolved to None. which() miss
+        must fall back to GO_BIN_DIRS (keeping PATH precedence for
+        hits — that contract stays intact)."""
+        go_dir, shadow_dir, make = fake_bins
+        make("vulnz", "vulnz v1.0", go_dir)  # NOT on PATH at all
+        monkeypatch.setenv("PATH", str(shadow_dir))
+        monkeypatch.delenv("GOPATH", raising=False)
+        monkeypatch.delenv("GOBIN", raising=False)
+        monkeypatch.setattr(tools, "GO_BIN_DIRS", (go_dir,))
+        tools._validate_cache.clear()
+        resolved = tools.resolve_tool("vulnz")
+        assert resolved is not None
+        assert str(go_dir / "vulnz") in resolved
+
+    def test_path_hit_still_wins_for_non_shadowers(self, fake_bins, monkeypatch):
+        """PATH precedence contract for non-shadowers is preserved when
+        the tool IS on PATH (tests rely on user-controlled PATH)."""
+        go_dir, shadow_dir, make = fake_bins
+        make("pathonly", "from-path", shadow_dir)
+        make("pathonly", "from-go-bin", go_dir)
+        monkeypatch.setenv("PATH", f"{shadow_dir}{os.pathsep}{go_dir}")
+        monkeypatch.delenv("GOPATH", raising=False)
+        monkeypatch.delenv("GOBIN", raising=False)
+        monkeypatch.setattr(tools, "GO_BIN_DIRS", (go_dir,))
+        tools._validate_cache.clear()
+        resolved = tools.resolve_tool("pathonly")
+        assert resolved is not None
+        assert "from-path" not in resolved  # path, not output — check dir
+        assert str(shadow_dir / "pathonly") in resolved
+
 
 class TestRunnerUsesResolvedBinary:
     def test_runner_rewrites_cmd0_to_resolved_path(self, fake_bins, monkeypatch):

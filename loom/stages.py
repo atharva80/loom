@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+from pathlib import Path
 from typing import Optional
 
 from .pipeline import PipelineContext, StageFn
-from .runner import OutputItem, Runner
+from .runner import OutputItem, Runner, _safe_host as _safe_name
 
 
 # Default binary path for each tool. If the binary isn't in PATH, the
@@ -43,6 +44,14 @@ DEFAULT_BIN = {
     "gau": "gau",
     "waybackurls": "waybackurls",
     "amass": "amass",
+    "uncover": "uncover",
+    "tlsx": "tlsx",
+    "dalfox": "dalfox",
+    "crlfuzz": "crlfuzz",
+    "kxss": "kxss",
+    "hakrawler": "hakrawler",
+    "subjack": "subjack",
+    "alterx": "alterx",
 }
 
 
@@ -420,5 +429,244 @@ def make_ffuf_stage(*, bin_path: Optional[str] = None, wordlist: str = "/usr/sha
             "ffuf", cmd, stage="fuzz", host=host,
             parser="raw", timeout=timeout, check=True,
         )
+        return result.items
+    return _stage
+
+
+# ============================================================
+# uncover — passive exposed-asset discovery (multi search engine)
+# ============================================================
+
+
+def uncover_command(domain: str, *, bin_path: str = "uncover",
+                    timeout: float = 120.0) -> list[str]:
+    """uncover -q 'subdomain:<domain>' -silent (PD query syntax)."""
+    return [bin_path, "-q", f"subdomain:{domain}", "-silent"]
+
+
+def make_uncover_stage(*, bin_path: Optional[str] = None,
+                       timeout: float = 120.0) -> StageFn:
+    async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        cmd = uncover_command(host, bin_path=bin_path or DEFAULT_BIN["uncover"],
+                              timeout=timeout)
+        result = runner.run(
+            "uncover", cmd, stage="subenum", host=host,
+            parser="subfinder", timeout=timeout, check=True,
+        )
+        # Share with resolve, like the other subenum stages.
+        subs = ctx.extras.setdefault("subdomains", [])
+        for it in result.items:
+            if it.kind == "subdomain" and it.value not in subs:
+                subs.append(it.value)
+        return result.items
+    return _stage
+
+
+# ============================================================
+# tlsx — TLS certificate SAN/CN harvesting (discovers hidden hosts)
+# ============================================================
+
+
+def tlsx_command(host: str, *, bin_path: str = "tlsx",
+                 timeout: float = 120.0) -> list[str]:
+    """tlsx -u <host> -j -san -cn — JSON out, SAN + CN fields."""
+    return [bin_path, "-u", host, "-j", "-san", "-cn", "-silent"]
+
+
+def make_tlsx_stage(*, bin_path: Optional[str] = None,
+                    timeout: float = 120.0) -> StageFn:
+    async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        cmd = tlsx_command(host, bin_path=bin_path or DEFAULT_BIN["tlsx"],
+                           timeout=timeout)
+        result = runner.run(
+            "tlsx", cmd, stage="tls", host=host,
+            parser="tlsx", timeout=timeout, check=True,
+        )
+        # SAN entries may reveal hosts not in passive sources; feed
+        # them into the subdomain pool for later resolution/probing.
+        subs = ctx.extras.setdefault("subdomains", [])
+        for it in result.items:
+            if it.kind in ("san", "subdomain") and it.value not in subs:
+                subs.append(it.value)
+        return result.items
+    return _stage
+
+
+# ============================================================
+# dalfox — XSS scanner (stdin pipe mode over parameterized URLs)
+# ============================================================
+
+
+def dalfox_command(url: str, *, bin_path: str = "dalfox",
+                   timeout: float = 600.0) -> list[str]:
+    """dalfox pipe --silence --no-color --format jsonl (URL on stdin)."""
+    return [bin_path, "pipe", "--silence", "--no-color", "--format", "jsonl"]
+
+
+def make_dalfox_stage(*, bin_path: Optional[str] = None,
+                      timeout: float = 600.0) -> StageFn:
+    async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        urls = ctx.extras.get("urls_params") or ctx.extras.get("urls") or []
+        if not urls:
+            return []
+        cmd = dalfox_command(urls[0], bin_path=bin_path or DEFAULT_BIN["dalfox"],
+                             timeout=timeout)
+        result = runner.run_streaming(
+            "dalfox", cmd, stage="xss", host=host,
+            parser="dalfox", timeout=timeout, check=True,
+            stdin="\n".join(urls),
+        )
+        return result.items
+    return _stage
+
+
+# ============================================================
+# crlfuzz — CRLF injection over a URL list (via -l file)
+# ============================================================
+
+
+def crlfuzz_command(urls: list[str], *, bin_path: str = "crlfuzz",
+                    timeout: float = 300.0) -> list[str]:
+    """crlfuzz -l <file> -s — file input so targets persist on disk."""
+    return [bin_path, "-l", "<URLS_FILE>", "-s"]
+
+
+def make_crlfuzz_stage(*, bin_path: Optional[str] = None,
+                       timeout: float = 300.0) -> StageFn:
+    async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        urls = ctx.extras.get("urls") or []
+        if not urls:
+            return []
+        # crlfuzz takes -l FILE (not stdin); write the URL list to the
+        # workdir so the invocation is reproducible.
+        base = Path(ctx.workdir) if ctx.workdir else Path(".")
+        list_path = base / "inputs" / _safe_name(host) / "crlfuzz-urls.txt"
+        list_path.parent.mkdir(parents=True, exist_ok=True)
+        list_path.write_text("\n".join(urls), encoding="utf-8")
+        cmd = [bin_path or DEFAULT_BIN["crlfuzz"], "-l", str(list_path), "-s"]
+        result = runner.run(
+            "crlfuzz", cmd, stage="xss", host=host,
+            parser="kxss", timeout=timeout, check=True,
+        )
+        return result.items
+    return _stage
+
+
+# ============================================================
+# kxss — reflected-parameter detection over URLs with querystrings
+# ============================================================
+
+
+def kxss_command(*, bin_path: str = "kxss") -> list[str]:
+    """kxss reads URLs from stdin; no flags."""
+    return [bin_path]
+
+
+def make_kxss_stage(*, bin_path: Optional[str] = None,
+                    timeout: float = 300.0) -> StageFn:
+    async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        urls = ctx.extras.get("urls_params") or [
+            u for u in (ctx.extras.get("urls") or []) if "?" in u
+        ]
+        if not urls:
+            return []
+        result = runner.run_streaming(
+            "kxss", ["kxss"], stage="xss", host=host,
+            parser="kxss", timeout=timeout, check=True,
+            stdin="\n".join(urls),
+        )
+        return result.items
+    return _stage
+
+
+# ============================================================
+# hakrawler — second crawler (js-crawl, in-scope only)
+# ============================================================
+
+
+def hakrawler_command(target: str, *, bin_path: str = "hakrawler",
+                      depth: int = 2, timeout: float = 300.0) -> list[str]:
+    """hakrawler -d <depth> -sink <url> (positional URL, stdin unused)."""
+    return [bin_path, "-d", str(depth), "-i", "-sink", target]
+
+
+def make_hakrawler_stage(*, bin_path: Optional[str] = None, depth: int = 2,
+                         timeout: float = 300.0) -> StageFn:
+    async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        target = host if host.startswith(("http://", "https://")) else f"https://{host}"
+        cmd = hakrawler_command(target, bin_path=bin_path or DEFAULT_BIN["hakrawler"],
+                                depth=depth, timeout=timeout)
+        result = runner.run_streaming(
+            "hakrawler", cmd, stage="crawl", host=host,
+            parser="katana", timeout=timeout, check=True,
+            stdin=f"{target}\n",
+        )
+        # Share crawled URLs with downstream stages (nuclei/xss).
+        urls = ctx.extras.setdefault("urls", [])
+        for it in result.items:
+            if it.kind == "url" and it.value not in urls:
+                urls.append(it.value)
+        return result.items
+    return _stage
+
+
+# ============================================================
+# subjack — subdomain takeover checks (CNAME + every-URL mode)
+# ============================================================
+
+
+def subjack_command(domain: str, *, bin_path: str = "subjack",
+                    timeout: float = 300.0) -> list[str]:
+    """subjack -d <domain> -a -v — all-URL mode with verbose findings."""
+    return [bin_path, "-d", domain, "-a", "-v"]
+
+
+def make_subjack_stage(*, bin_path: Optional[str] = None,
+                       timeout: float = 300.0) -> StageFn:
+    async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        cmd = subjack_command(host, bin_path=bin_path or DEFAULT_BIN["subjack"],
+                              timeout=timeout)
+        result = runner.run(
+            "subjack", cmd, stage="takeover", host=host,
+            parser="raw", timeout=timeout, check=True,
+        )
+        items: list[OutputItem] = []
+        for it in result.items:
+            if it.kind == "raw" and "[+]" in it.value:
+                items.append(OutputItem(
+                    kind="takeover", value=it.value.strip(),
+                    evidence={"source": "subjack", "target": it.value},
+                ))
+        return items
+    return _stage
+
+
+# ============================================================
+# alterx — subdomain permutation generator (feeds dnsx re-resolve)
+# ============================================================
+
+
+def alterx_command(*, bin_path: str = "alterx") -> list[str]:
+    """alterx -silent (subs on stdin, permutations on stdout)."""
+    return [bin_path, "-silent"]
+
+
+def make_alterx_stage(*, bin_path: Optional[str] = None,
+                      timeout: float = 120.0) -> StageFn:
+    async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        subs = ctx.extras.get("subdomains") or []
+        if not subs:
+            return []
+        result = runner.run_streaming(
+            "alterx", ["alterx", "-silent"], stage="permute", host=host,
+            parser="alterx", timeout=timeout, check=True,
+            stdin="\n".join(subs),
+        )
+        # New permutations join the subdomain pool; the DAG's permute
+        # node feeds resolve so they get checked for existence.
+        subs = ctx.extras.setdefault("subdomains", [])
+        for it in result.items:
+            if it.kind == "subdomain" and it.value not in subs:
+                subs.append(it.value)
         return result.items
     return _stage

@@ -233,6 +233,91 @@ def parse_raw(stdout: str) -> list[OutputItem]:
     return []
 
 
+def parse_tlsx(stdout: str) -> list[OutputItem]:
+    """tlsx -json output: one JSON object per host with san/cn fields.
+
+    Emits:
+      kind="san"       — every SAN entry (feeds permute/subenum)
+      kind="subdomain" — the subject_cn as a resolved host name
+    """
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        host = obj.get("host") or obj.get("subject_cn")
+        if not host:
+            continue
+        san = obj.get("san") or ""
+        for entry in str(san).split(";"):
+            entry = entry.strip().lower()
+            if entry:
+                items.append(OutputItem(kind="san", value=entry,
+                                        evidence={"source": "tlsx"}))
+        if _SUBDOMAIN_RE.match(host):
+            items.append(OutputItem(kind="subdomain", value=host.lower(),
+                                    evidence={"source": "tlsx",
+                                              "subject_cn": obj.get("subject_cn")}))
+    return items
+
+
+def parse_dalfox(stdout: str) -> list[OutputItem]:
+    """dalfox --format jsonl: one JSON object per finding."""
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        url = obj.get("url") or obj.get("data")
+        vuln = obj.get("vuln") or obj.get("vulnerability") or "XSS"
+        if url:
+            items.append(OutputItem(kind="finding", value=str(url), evidence={
+                "source": "dalfox",
+                "vuln": vuln,
+                "method": obj.get("method"),
+                "payload": obj.get("payload"),
+                "severity": obj.get("severity"),
+                "raw": obj,
+            }))
+    return items
+
+
+def parse_kxss(stdout: str) -> list[OutputItem]:
+    """kxss output: one reflected-parameter URL per line; skips
+    [INF]/[WRN]/[ERR] progress noise."""
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s or s.startswith("["):
+            continue
+        if _URL_RE.match(s):
+            items.append(OutputItem(kind="finding", value=s,
+                                    evidence={"source": "kxss",
+                                              "vuln": "reflected-xss"}))
+    return items
+
+
+def parse_alterx(stdout: str) -> list[OutputItem]:
+    """alterx output: one permutation subdomain per line."""
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if not s or s.startswith("["):
+            continue
+        if _SUBDOMAIN_RE.match(s):
+            items.append(OutputItem(kind="subdomain", value=s.lower(),
+                                    evidence={"source": "alterx"}))
+    return items
+
+
 PARSERS: dict[str, Callable[[str], list[OutputItem]]] = {
     "subfinder": parse_subfinder,
     "httpx": parse_httpx,
@@ -245,6 +330,10 @@ PARSERS: dict[str, Callable[[str], list[OutputItem]]] = {
     "assetfinder": parse_assetfinder,
     "amass": parse_amass,
     "ffuf": parse_raw,    # ffuf has JSON; v1 keeps raw
+    "tlsx": parse_tlsx,
+    "dalfox": parse_dalfox,
+    "kxss": parse_kxss,
+    "alterx": parse_alterx,
     "raw": parse_raw,
 }
 
