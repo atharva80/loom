@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.8.10 — 2026-09-05
+
+status-server honors the global --workdir (same footgun as sweeps).
+
+- **The gap**: `status-server --workdir` was required, so the global
+  was silently ignored and the server either died (argparse) or
+  watched the wrong dir. Never caught — zero tests touched it.
+- **The fix**: SUPPRESS + global fallback, both orders tested.
+- **Proof**: new `TestStatusServerWorkdir` (both orders); live serve
+  + `/api/status` returns real runs/stages/log-tail for the requested
+  workdir (page polls it every 2s).
+
 ## v0.8.9 — 2026-09-05
 
 `run --scopes-file` no longer demands a positional domain.

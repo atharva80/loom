@@ -270,3 +270,30 @@ class TestValidate:
         # If `python` is in PATH (it is, since this is running under
         # python), at least the tool-check column header should appear.
         assert "tool" in out
+
+
+class TestStatusServerWorkdir:
+    """status-server honors the global --workdir (v0.8.7 footgun class)."""
+
+    def test_global_workdir_reaches_server(self, tmp_path, monkeypatch):
+        import argparse
+        from loom import cli as _cli
+        seen = {}
+        monkeypatch.setattr("loom.webstatus.serve",
+                            lambda wd, port: seen.update(wd=wd, port=port))
+        args = _cli.build_parser().parse_args(
+            ["--workdir", str(tmp_path), "status-server", "--port", "18099"])
+        assert _cli._cmd_status_server(args) == 0
+        assert str(seen["wd"]) == str(tmp_path)
+        assert seen["port"] == 18099
+
+    def test_subcommand_workdir_overrides(self, tmp_path, monkeypatch):
+        from loom import cli as _cli
+        seen = {}
+        monkeypatch.setattr("loom.webstatus.serve",
+                            lambda wd, port: seen.update(wd=wd, port=port))
+        wd = tmp_path / "w"
+        args = _cli.build_parser().parse_args(
+            ["status-server", "--workdir", str(wd), "--port", "18098"])
+        assert _cli._cmd_status_server(args) == 0
+        assert str(seen["wd"]) == str(wd)

@@ -1500,7 +1500,8 @@ def build_parser() -> argparse.ArgumentParser:
     # status-server — minimal live run-status web page
     pss = sub.add_parser("status-server",
                          help="serve a minimal live run-status web page")
-    pss.add_argument("--workdir", required=True, help="loom workdir to watch")
+    pss.add_argument("--workdir", default=argparse.SUPPRESS,
+                     help="loom workdir to watch (default: global --workdir)")
     pss.add_argument("--port", type=int, default=8080)
     pss.set_defaults(func=_cmd_status_server)
 
@@ -1509,7 +1510,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _cmd_status_server(args: argparse.Namespace) -> int:
     from .webstatus import serve
-    serve(Path(args.workdir).expanduser(), args.port)
+    # --workdir is SUPPRESS here so the global survives (same argparse
+    # footgun as sweeps, v0.8.7).
+    workdir = Path(getattr(args, "workdir", None)
+                   or str(DEFAULT_WORKDIR)).expanduser()
+    serve(workdir, args.port)
     return 0
 
 
