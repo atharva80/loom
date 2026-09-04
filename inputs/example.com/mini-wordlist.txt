@@ -1,8 +1,0 @@
-admin
-backup
-dev
-db.sql
-phpinfo.php
-test
-.git
-.env

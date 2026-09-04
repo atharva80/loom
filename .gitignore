@@ -14,3 +14,8 @@ secrets.cfg
 # OS
 .DS_Store
 *.swp
+
+# Loom stage fallbacks (crlfuzz URL lists, mini wordlists) must live
+# under the run workdir, never the repo root — a bare-cwd fallback
+# during ad-hoc/test runs once polluted the repo.
+inputs/

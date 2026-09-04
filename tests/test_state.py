@@ -144,3 +144,22 @@ def test_mark_done_sets_finished_at(state):
     ).fetchone()
     assert r["finished_at"] is not None
     assert r["finished_at"] >= r["started_at"]
+
+
+def test_finish_run_persists_across_instances(tmp_path):
+    """finish_run must be durable the moment it returns — a SIGKILLed
+    run resumed later depends on it (live question 2026-09-05: a
+    finished_at row must survive process death, no explicit commit
+    by the caller)."""
+    p = tmp_path / "state.db"
+    s1 = State(p)
+    rid = s1.start_run("example.com", pipeline="deep")
+    s1.finish_run(rid)
+    s1.close()
+
+    s2 = State(p)
+    run = s2.get_run(rid)
+    assert run is not None
+    assert run["finished_at"] is not None
+    assert run["finished_at"] >= run["started_at"]
+    s2.close()
