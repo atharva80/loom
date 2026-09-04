@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.8.6 — 2026-09-05
+
+Vulnscan gate widened (third and last probe-only gate).
+
+- **The audit**: the `subdomain` pipeline's `vulnscan` node is
+  `make_nuclei_stage` (consumes scan_pool) behind a probe-only gate
+  — the same hole as scan (v0.8.4) and fuzz (v0.8.5). Gate is now
+  the url pool; `depends_on` extended to `urls`/`urls_gau`.
+- Gate map (all active nodes now match what their stage consumes):
+  scan/fuzz/xss/vulnscan/params/jssecrets on the pool (fuzz also on
+  resolve subs), takeover/asn/resolve on subs, screenshot on live
+  probe, subenum stages unconditional.
+- **Proof**: `TestVulnscanGate` in `tests/test_scan_pool_gate.py`.
+
 ## v0.8.5 — 2026-09-05
 
 Fuzz gate widened to known hosts (same hole as scan).

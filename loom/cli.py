@@ -479,8 +479,13 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
         ))
         dag.add(Node(
-            id="vulnscan", inputs={"url"}, depends_on=["probe"],
-            should_run=lambda s: s.from_node("probe", "url") > 0,
+            id="vulnscan", inputs={"url"},
+            depends_on=["probe", "urls", "urls_gau"],
+            # Pool gate: make_nuclei_stage consumes scan_pool ←
+            # extras["urls"] (any source), not probe alone (v0.8.4/5).
+            should_run=lambda s: (s.from_node("urls", "url")
+                                  + s.from_node("urls_gau", "url")
+                                  + s.from_node("probe", "url")) > 0,
         ))
         stages = {
             "subenum_subfinder": make_subfinder_stage(),

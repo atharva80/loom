@@ -50,6 +50,27 @@ class TestScanRunsOnUrlPool:
         assert _scan_predicate(pipeline)(_state()) is False
 
 
+class TestVulnscanGate:
+    """The `subdomain` pipeline's `vulnscan` node is make_nuclei_stage
+    (consumes scan_pool) behind a probe-only gate — same hole."""
+
+    def _pred(self):
+        dag, _ = cli._build_pipeline("subdomain",
+                                     LiveLogger(Path("/tmp")), None, None)
+        pred = dag.get("vulnscan").should_run
+        assert pred is not None
+        return pred
+
+    def test_runs_on_passive_urls_without_probe(self):
+        assert self._pred()(_state(urls=200)) is True
+
+    def test_runs_on_probe_urls(self):
+        assert self._pred()(_state(probe=3)) is True
+
+    def test_skips_when_pool_empty(self):
+        assert self._pred()(_state()) is False
+
+
 class TestScanGateEndToEnd:
     """The real deep `scan` predicate inside a live Pipeline: passive
     urls flow, probe is empty, scan must execute (not skip)."""
