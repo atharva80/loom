@@ -8,8 +8,7 @@ the host is a catch-all — every URL returns the same content. Heavy stages
 We classify into:
   - clean:    random paths return 404, / returns 200 (real app)
   - catchall: random paths return same body as / (SPA shell, S3 static, S3 error)
-  - soft:     random paths return some body but different from /, with low entropy
-  - error:    can't reach host / all paths fail
+  - error:    can't reach host / all paths fail (every tried scheme)
 """
 
 import hashlib
@@ -167,7 +166,7 @@ def detect(host: str, https: bool = True, timeout: float = 8.0) -> dict:
     Returns:
       {
         "host": str,
-        "classification": "clean" | "catchall" | "soft" | "error",
+        "classification": "clean" | "catchall" | "error",
         "confidence": float (0.0-1.0),
         "evidence": dict,
       }

@@ -25,6 +25,10 @@ class EventLog:
             event = {**event, **kwargs}
         if "ts" not in event:
             event["ts"] = time.time()
+        # Contract (LOOM_OUTPUTS.md §events.jsonl): evidence is always
+        # present so agents can index it unconditionally. stage stays
+        # optional (only stage-backed writes set it).
+        event.setdefault("evidence", {})
         line = json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n"
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(line)

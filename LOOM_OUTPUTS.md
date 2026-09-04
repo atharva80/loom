@@ -1,10 +1,10 @@
-# LOOM_OUTPUTS — machine-readable output contract (v0.7)
+# LOOM_OUTPUTS — machine-readable output contract (v0.8)
 
 This file is the contract for AGENTS and scripts consuming loom
 output. Human tables may change; the JSON shapes below are stable.
-Every read command (`status`, `list-runs`, `findings`, `validate`)
-accepts `--json` and prints exactly one JSON document to stdout
-(exit codes below). Diagnostics go to stderr.
+Every read command (`status`, `list-runs`, `findings`, `validate`,
+`diff`) accepts `--json` and prints exactly one JSON document to
+stdout (exit codes below). Diagnostics go to stderr.
 
 ## Layout
 
@@ -26,7 +26,9 @@ is null when no stdin was passed).
 ## events.jsonl
 
 One object per line: `{type, source, host, value, ts, evidence, stage?}`.
-`type` is the artifact kind (below). Malformed lines are skipped by
+`type` is the artifact kind (below). `evidence` is always present
+(`{}` when the writer has nothing to add); `stage` only on
+stage-backed writes. Malformed lines are skipped by
 readers — never assume line count == event count.
 
 ### Artifact kinds
@@ -43,7 +45,7 @@ readers — never assume line count == event count.
 | `asn` | `AS15169` | `input`, `as_name` |
 | `cidr` | `8.8.8.0/24` | `input`, `asn` |
 | `screenshot` | shot file path | `source: gowitness`, `host` |
-| `catchall_result` | `clean`/`catchall`/… | `confidence` |
+| `catchall_result` | `clean`/`catchall`/`error` | `confidence`, `scheme` (`https`/`http`), probe `root_*`/`rand1_*`/`rand2_*` |
 | `raw` | unparsed tool output | tool-dependent |
 
 ### Severity vocabulary (findings)
@@ -70,6 +72,8 @@ scope_profile,status,started_at,finished_at,duration_s}`,
 `events{type: count}`, `summary` (== `run_summary`), `resolved_tools`
 (`{tool: path|null}`). Written automatically at the end of `run`,
 `resume`, and every `sweeps` scope. `write_manifest` never raises.
+`loom/manifest.schema.json` (Draft 2020-12, shipped as package data)
+validates the shape — see `validate_manifest()`.
 
 ## Exit codes
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.8.2 — 2026-09-05
+
+Contract-doc accuracy: LOOM_OUTPUTS.md now matches behavior, enforced by tests.
+
+- **Removed phantom `soft` classification** from `catchall.py` docstrings —
+  the code only emits `clean|catchall|error`; agents will never see `soft`.
+- **`evidence: {}` guaranteed** (`EventLog.append` defaults it) so agents
+  can index `evidence` unconditionally; doc says so explicitly.
+- **New `tests/test_contract.py`**: pins the `--json` command set, the
+  event-line key shape, and the catchall value/evidence vocabularies
+  against LOOM_OUTPUTS.md — doc and code must change together.
+- Shared catchall HTTP fixtures moved to `tests/conftest.py`.
+- Doc now lists `diff` under `--json`, the exact `catchall_result`
+  vocabulary + `scheme` key, and the manifest schema file.
+- 494/494 green.
+
 ## v0.8.1 — 2026-09-05
 
 Catchall accuracy: HTTPS→HTTP fallback + off-loop probing.
