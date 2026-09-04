@@ -87,7 +87,7 @@ class TestCommandBuilders:
         assert cmd[0] == "naabu"
         assert "-host" in cmd
         assert "example.com" in cmd
-        assert "-ports" in cmd
+        assert "-top-ports" in cmd  # live-verified: -ports doesn't exist
 
     def test_nuclei_command(self):
         cmd = nuclei_command("https://example.com")

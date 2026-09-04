@@ -204,11 +204,17 @@ def make_httpx_stage(*, bin_path: Optional[str] = None,
 
 
 def naabu_command(host: str, *, bin_path: str = "naabu",
-                  ports: str = "top-100", timeout: float = 180.0) -> list[str]:
-    return [bin_path, "-host", host, "-ports", ports, "-silent", "-no-color"]
+                  ports: str = "100", timeout: float = 180.0) -> list[str]:
+    """naabu -host <h> -top-ports <n> -silent -no-color.
+
+    Live-verified 2026-09-05: naabu has no -ports flag (exit 2,
+    'flag provided but not defined') and 'top-100' is not a valid
+    -p value. The correct form is -top-ports 100.
+    """
+    return [bin_path, "-host", host, "-top-ports", ports, "-silent", "-no-color"]
 
 
-def make_naabu_stage(*, bin_path: Optional[str] = None, ports: str = "top-100",
+def make_naabu_stage(*, bin_path: Optional[str] = None, ports: str = "100",
                      timeout: float = 180.0) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
         cmd = naabu_command(host, bin_path=bin_path or DEFAULT_BIN["naabu"],

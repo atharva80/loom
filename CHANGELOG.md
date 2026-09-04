@@ -44,6 +44,8 @@ and a preflight tool gate.
   dnsx resolve stage. Now `-limit 5000` by default (configurable).
 - **ffuf flags** — `-silent -noninteractive` are not real ffuf flags
   (the binary just printed help). Now `-s -json`.
+- **naabu flags** — naabu has no `-ports` flag and `top-100` is not a
+  valid `-p` value (live-verified exit 2). Now `-top-ports 100`.
 - **Version drift** — pyproject said 0.1.0 while CHANGELOG was at
   v0.3.0; a consistency test now locks them together.
 
