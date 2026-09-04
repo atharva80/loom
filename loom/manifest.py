@@ -106,3 +106,25 @@ def write_manifest(workdir: str | Path, run_id: int) -> Optional[Path]:
     except OSError:
         return None
     return out
+
+
+def manifest_schema() -> dict:
+    """Load the bundled manifest JSON Schema (shipped as package data)."""
+    import loom as _loom_pkg
+    schema_path = Path(_loom_pkg.__file__).parent / "manifest.schema.json"
+    return json.loads(schema_path.read_text(encoding="utf-8"))
+
+
+def validate_manifest(manifest: dict) -> list[str]:
+    """Validate a manifest dict against the schema. Returns a list of
+    human-readable errors (empty == valid). jsonschema is a dev
+    dependency; production callers should treat this as diagnostic."""
+    import jsonschema
+    errors = sorted(
+        jsonschema.Draft202012Validator(manifest_schema()).iter_errors(manifest),
+        key=lambda e: list(e.path),
+    )
+    return [
+        f"{'/'.join(str(p) for p in e.path) or '<root>'}: {e.message}"
+        for e in errors
+    ]

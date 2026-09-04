@@ -4,19 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "loom"
-version = "0.7.0"
+version = "0.7.1"
 description = "Streaming DAG orchestrator for bug bounty recon (forked from reconftw)"
 requires-python = ">=3.10"
 dependencies = ["pyyaml"]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "jsonschema"]
 
 [project.scripts]
 loom = "loom.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["loom*"]
+
+[tool.setuptools.package-data]
+loom = ["*.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

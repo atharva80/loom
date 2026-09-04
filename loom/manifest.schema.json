@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/atharva80/loom/blob/main/loom/manifest.schema.json",
+  "title": "loom run manifest",
+  "description": "run-<id>/manifest.json — machine-readable run summary. Consumers must tolerate additional keys (additive evolution only).",
+  "type": "object",
+  "required": ["loom_version", "run", "stages", "events", "summary", "resolved_tools"],
+  "properties": {
+    "loom_version": {"type": "string", "minLength": 1},
+    "run": {
+      "type": "object",
+      "required": ["id", "domain", "pipeline", "status"],
+      "properties": {
+        "id": {"type": "integer"},
+        "domain": {"type": ["string", "null"]},
+        "pipeline": {"type": ["string", "null"]},
+        "mode": {"type": ["string", "null"]},
+        "scope_profile": {"type": ["string", "null"]},
+        "status": {"type": "string", "enum": ["done", "inflight"]},
+        "started_at": {"type": ["number", "null"]},
+        "finished_at": {"type": ["number", "null"]},
+        "duration_s": {"type": ["number", "null"]}
+      }
+    },
+    "stages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["host", "tool", "stage", "status"],
+        "properties": {
+          "host": {"type": "string"},
+          "tool": {"type": "string"},
+          "stage": {"type": "string"},
+          "status": {"type": "string", "enum": ["pending", "running", "done", "failed", "skipped", "timeout"]},
+          "duration_s": {"type": ["number", "null"]},
+          "error": {"type": ["string", "null"]},
+          "output_path": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "events": {
+      "type": "object",
+      "additionalProperties": {"type": "integer"}
+    },
+    "summary": {
+      "type": ["object", "null"]
+    },
+    "resolved_tools": {
+      "type": "object",
+      "additionalProperties": {"type": ["string", "null"]}
+    }
+  }
+}

@@ -90,6 +90,19 @@ class TestManifestBuilder:
         State(tmp_path / "loom.sqlite").close()
         assert write_manifest(tmp_path, 999) is None
 
+    def test_manifest_validates_against_schema(self, tmp_path):
+        from loom.manifest import build_manifest, validate_manifest
+        rid = _seed_run(tmp_path)
+        errors = validate_manifest(build_manifest(tmp_path, rid))
+        assert errors == []
+
+    def test_schema_rejects_garbage(self):
+        from loom.manifest import validate_manifest
+        assert validate_manifest({}) != []
+        assert validate_manifest(
+            {"loom_version": "x", "run": {"id": 1}, "stages": [],
+             "events": {}, "summary": None, "resolved_tools": {}}) != []
+
 
 class TestJsonSurface:
     def test_status_json(self, tmp_path, capsys):

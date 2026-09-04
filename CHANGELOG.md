@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.7.1 — 2026-09-05
+
+Contract enforcement: the manifest schema ships in-repo and the
+exit-code contract is pinned by tests.
+
+- **`loom/manifest.schema.json`** (Draft 2020-12, shipped as package
+  data) + `validate_manifest()` — agents can validate before parsing.
+- **Exit-code contract tests** (`tests/test_exit_codes.py`): every
+  documented 0/1/2 path pinned.
+- **amass brute verdict**: 20k-word brute emits real subs within the
+  node budget (`rest/testasp/testaspnet/testphp/www` in the first 75
+  output lines) — the top-20k slice ordering is confirmed productive.
+- 478/478 passing.
+
 ## v0.7.0 — 2026-09-05
 
 Agent-grade outputs: every read command speaks JSON, every run leaves
