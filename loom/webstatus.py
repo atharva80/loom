@@ -48,6 +48,8 @@ PAGE = """<!doctype html>
   td.tool { color: #d0d0d0; }
   td.stage { color: #888; }
   td.dur { color: #6a6a6a; text-align: right; }
+  .err { color: #e05f5f; font-size: 11.5px; padding: 2px 12px 6px 12px;
+         white-space: pre-wrap; word-break: break-all; }
   .st { font-weight: 600; }
   .st-done { color: #5fdd5f; } .st-running { color: #e8c15a; }
   .st-failed { color: #e05f5f; } .st-timeout { color: #e05f5f; }
@@ -94,7 +96,11 @@ function render(d) {
             '<tr><td class="tool">' + esc(s.tool) + '</td>' +
             '<td class="stage">' + esc(s.stage) + '</td>' +
             '<td class="' + cls(s.status) + '">' + esc(s.status) + '</td>' +
-            '<td class="dur">' + fmtDur(s.duration_s) + '</td></tr>').join('') +
+            '<td class="dur">' + fmtDur(s.duration_s) + '</td></tr>' +
+            ((s.status === 'failed' || s.status === 'timeout') && s.error
+              ? '<tr><td></td><td class="err" colspan="3">' +
+                esc(s.error).slice(0, 500) + '</td></tr>'
+              : '')).join('') +
           '</table>'
         : '<div class="empty">no stages yet</div>';
       return '<div class="run"><div class="run-head">' +

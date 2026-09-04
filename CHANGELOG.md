@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.8.11 — 2026-09-05
+
+Status page surfaces stage errors; snapshot() pinned by tests.
+
+- **The gap**: `/api/status` carried per-stage `error` but the page
+  never rendered it — failed/timeout rows showed red with no reason.
+  And `snapshot()` (what agents poll) had zero tests.
+- **The fix**: failed/timeout stages render their (escaped, 500-char
+  capped) error under the row; new `tests/test_webstatus.py` pins
+  the snapshot contract (order, statuses, error passthrough, 60-line
+  log tail from the newest run, event counts, empty workdir).
+
 ## v0.8.10 — 2026-09-05
 
 status-server honors the global --workdir (same footgun as sweeps).
