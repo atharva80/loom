@@ -381,6 +381,12 @@ def make_waybackurls_stage(*, bin_path: Optional[str] = None,
             "waybackurls", cmd, stage="urls", host=host,
             parser="waybackurls", timeout=timeout, check=True,
         )
+        # Share with the downstream xss fanout (live-verified bug
+        # 2026-09-04: output never reached ctx.extras['urls']).
+        urls = ctx.extras.setdefault("urls", [])
+        for it in result.items:
+            if it.kind == "url" and it.value not in urls:
+                urls.append(it.value)
         return result.items
     return _stage
 
@@ -393,6 +399,12 @@ def make_gau_stage(*, bin_path: Optional[str] = None,
             "gau", cmd, stage="urls", host=host,
             parser="gau", timeout=timeout, check=True,
         )
+        # Share with the downstream xss fanout (live-verified bug
+        # 2026-09-04: 15k gau URLs on vulnweb never reached the pool).
+        urls = ctx.extras.setdefault("urls", [])
+        for it in result.items:
+            if it.kind == "url" and it.value not in urls:
+                urls.append(it.value)
         return result.items
     return _stage
 
@@ -537,18 +549,38 @@ def dalfox_command(url: str, *, bin_path: str = "dalfox",
     return [bin_path, "pipe", "--silence", "--no-color", "--format", "jsonl"]
 
 
+def _xss_pool(urls: list[str], *, cap: int = 500) -> list[str]:
+    """Build the URL list for xss fanout stages (dalfox/kxss/crlfuzz).
+
+    Live-verified lesson (2026-09-04): feeding the full 15k-URL gau
+    pool to dalfox ground the stage for minutes. Parameterized URLs
+    (the only ones XSS tools can actually test) go first; the list is
+    capped so a huge archive dump can't stall the pipeline.
+    """
+    seen: set[str] = set()
+    params: list[str] = []
+    plain: list[str] = []
+    for u in urls:
+        if u in seen:
+            continue
+        seen.add(u)
+        (params if "?" in u else plain).append(u)
+    return (params + plain)[:cap]
+
+
 def make_dalfox_stage(*, bin_path: Optional[str] = None,
-                      timeout: float = 600.0) -> StageFn:
+                      timeout: float = 600.0,
+                      max_urls: int = 500) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
-        urls = ctx.extras.get("urls_params") or ctx.extras.get("urls") or []
-        if not urls:
+        pool = _xss_pool(ctx.extras.get("urls") or [], cap=max_urls)
+        if not pool:
             return []
-        cmd = dalfox_command(urls[0], bin_path=bin_path or DEFAULT_BIN["dalfox"],
+        cmd = dalfox_command(pool[0], bin_path=bin_path or DEFAULT_BIN["dalfox"],
                              timeout=timeout)
         result = runner.run_streaming(
             "dalfox", cmd, stage="xss", host=host,
             parser="dalfox", timeout=timeout, check=True,
-            stdin="\n".join(urls),
+            stdin="\n".join(pool),
         )
         return result.items
     return _stage
@@ -566,9 +598,10 @@ def crlfuzz_command(urls: list[str], *, bin_path: str = "crlfuzz",
 
 
 def make_crlfuzz_stage(*, bin_path: Optional[str] = None,
-                       timeout: float = 300.0) -> StageFn:
+                       timeout: float = 300.0,
+                       max_urls: int = 500) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
-        urls = ctx.extras.get("urls") or []
+        urls = _xss_pool(ctx.extras.get("urls") or [], cap=max_urls)
         if not urls:
             return []
         # crlfuzz takes -l FILE (not stdin); write the URL list to the
@@ -597,11 +630,12 @@ def kxss_command(*, bin_path: str = "kxss") -> list[str]:
 
 
 def make_kxss_stage(*, bin_path: Optional[str] = None,
-                    timeout: float = 300.0) -> StageFn:
+                    timeout: float = 300.0,
+                    max_urls: int = 500) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
-        urls = ctx.extras.get("urls_params") or [
-            u for u in (ctx.extras.get("urls") or []) if "?" in u
-        ]
+        raw = ctx.extras.get("urls_params") or ctx.extras.get("urls") or []
+        # kxss only makes sense on parameterized URLs; cap the rest.
+        urls = [u for u in _xss_pool(raw, cap=max_urls) if "?" in u]
         if not urls:
             return []
         result = runner.run_streaming(

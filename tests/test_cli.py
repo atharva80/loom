@@ -29,11 +29,12 @@ def home_in_tmp(monkeypatch, tmp_path):
 
 class TestTopLevel:
     def test_version(self, capsys):
+        from loom import __version__
         with pytest.raises(SystemExit) as exc:
             cli.main(["--version"])
         assert exc.value.code == 0
         out = capsys.readouterr().out
-        assert "loom 0.1.0" in out
+        assert f"loom {__version__}" in out
 
     def test_help_exits_zero(self, capsys):
         with pytest.raises(SystemExit) as exc:

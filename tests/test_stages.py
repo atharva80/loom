@@ -277,6 +277,18 @@ class TestWaybackurlsStage:
             "https://a.example.com/old1", "https://a.example.com/old2"
         ]
 
+    async def test_waybackurls_shares_urls(self, fake_bin_dir, tmp_path):
+        """Live-verified bug (2026-09-04): waybackurls + gau output
+        didn't land in ctx.extras['urls'], so the xss/crlfuzz/kxss
+        fanout ran against an empty URL pool. Both url stages now
+        contribute to the shared pool (like katana already did)."""
+        ctx = PipelineContext(scope=Runner(_scope()).scope)
+        await make_waybackurls_stage()(Runner(_scope(), workdir=tmp_path),
+                                        "example.com", ctx)
+        assert ctx.extras["urls"] == [
+            "https://a.example.com/old1", "https://a.example.com/old2"
+        ]
+
 
 class TestGauStage:
     async def test_gau_emits_urls(self, fake_bin_dir: Path, tmp_path: Path):
@@ -284,6 +296,15 @@ class TestGauStage:
         stage = make_gau_stage()
         items = await stage(runner, "example.com", PipelineContext(scope=runner.scope))
         assert [i.value for i in items] == ["https://a.example.com/gau1"]
+
+    async def test_gau_shares_urls(self, fake_bin_dir, tmp_path):
+        """Live-verified bug (2026-09-04): gau emitted 15,064 URLs on
+        vulnweb but none made it into ctx.extras['urls'], so the
+        downstream xss fanout was a no-op. Now contributes to the pool."""
+        ctx = PipelineContext(scope=Runner(_scope()).scope)
+        await make_gau_stage()(Runner(_scope(), workdir=tmp_path),
+                                "example.com", ctx)
+        assert ctx.extras["urls"] == ["https://a.example.com/gau1"]
 
 
 class TestAmassStage:

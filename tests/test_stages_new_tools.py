@@ -326,6 +326,18 @@ class TestNewParsers:
         assert ("san", "b.a.com") in [(i.kind, i.value) for i in items]
         assert ("san", "c.a.com") in [(i.kind, i.value) for i in items]
 
+    def test_xss_pool_caps_and_prefers_params(self):
+        """Live-verified (2026-09-04): the xss fanout received the full
+        15k-URL gau pool and dalfox ground for minutes. _xss_pool()
+        prefers parameterized URLs and caps the list."""
+        from loom.stages import _xss_pool
+        plain = [f"https://a.com/{i}" for i in range(300)]
+        params = [f"https://a.com/s?q={i}" for i in range(10)]
+        pool = _xss_pool(plain + params, cap=100)
+        assert len(pool) == 100
+        assert all(u in pool for u in params)   # param URLs survive the cap
+        assert pool[:10] == params              # and come first
+
     def test_parse_dalfox_jsonl(self):
         out = ('{"vuln":"XSS","url":"https://a.com/?q=x","severity":"High"}\n'
                'not-json\n')
