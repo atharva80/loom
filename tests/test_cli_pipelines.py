@@ -95,3 +95,42 @@ class TestStageWeaving:
         # nuclei node consumes url stream from katana
         node = dag.get("nuclei")
         assert "url" in node.inputs
+
+
+class TestUrlScheduling:
+    """v0.5: archive-URL mining (gau/waybackurls) needs only the domain,
+    so it runs alongside resolve/probe instead of after probe (~60s off
+    the critical path on vulnweb). XSS nodes wait for probe too, so
+    probe-discovered URLs are never missed."""
+
+    def _levels(self, name):
+        from loom.live import LiveLogger
+
+        dag, stages = cli._build_pipeline(name, LiveLogger(Path("/tmp")), None, None)
+        dag.validate()
+        assert set(stages) == set(dag.ids())
+        lvls = dag.levels()
+        idx = {nid: i for i, lvl in enumerate(lvls) for nid in lvl}
+        return dag, idx
+
+    def test_urls_run_with_probe_not_after(self):
+        for name in ("full", "deep", "subdomain"):
+            _, idx = self._levels(name)
+            assert idx["urls"] <= idx["probe"], name
+            assert idx["urls_gau"] <= idx["probe"], name
+
+    def test_xss_waits_for_probe(self):
+        for name in ("full", "deep"):
+            dag, idx = self._levels(name)
+            for xss in ("xss", "xss_kxss", "xss_crlfuzz"):
+                assert "probe" in dag.get(xss).depends_on, (name, xss)
+                assert idx[xss] > idx["probe"], (name, xss)
+
+    def test_screenshot_wired(self):
+        from loom.live import LiveLogger
+
+        for name in ("full", "deep", "web"):
+            dag, stages = cli._build_pipeline(
+                name, LiveLogger(Path("/tmp")), None, None)
+            assert "screenshot" in stages, name
+            assert "screenshot" in dag.ids(), name

@@ -85,10 +85,11 @@ class TestSingleEventWriter:
         )
         assert res.exit_code == 0
         assert len(res.items) == 2
-        # saved stdout must have the newlines intact
-        saved = (tmp_path / "crawl" / "x.example.com" / "katana.stdout.txt")
-        assert saved.exists()
-        text = saved.read_text()
+        # saved stdout must have the newlines intact (v0.5 filenames
+        # carry a timestamp: katana.<ts>.stdout.txt)
+        saved = sorted((tmp_path / "crawl" / "x.example.com").glob("katana.*.stdout.txt"))
+        assert len(saved) == 1
+        text = saved[0].read_text()
         assert "https://a.example.com/\nhttps://b.example.com/" in text
 
     async def test_synthetic_stage_writes_nothing(self, tmp_path: Path):

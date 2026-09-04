@@ -23,6 +23,7 @@ a partial result if a parser is registered for it.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -318,10 +319,31 @@ def parse_alterx(stdout: str) -> list[OutputItem]:
     return items
 
 
+def parse_subjack(stdout: str) -> list[OutputItem]:
+    """subjack -v output: takeover hits are the lines containing [+].
+
+    A real parser (not stage-side conversion) so takeovers flow into
+    the eventlog/jsonl/DAG counts like every other finding — stage
+    return values alone never reach the eventlog (single-emitter
+    rule), which previously made takeovers invisible to
+    `loom findings`. Raw stdout.txt always keeps the full output.
+    """
+    items: list[OutputItem] = []
+    for line in stdout.splitlines():
+        s = line.strip()
+        if "[+]" in s:
+            items.append(OutputItem(kind="takeover", value=s,
+                                    evidence={"source": "subjack",
+                                              "target": s}))
+    return items
+
+
 def parse_ffuf_jsonl(stdout: str) -> list[OutputItem]:
     """ffuf -json output: newline-delimited JSON records.
 
     Emits finding items for fuzz hits (url, status, input, length).
+    ffuf base64-encodes the input map values — decoded for evidence
+    (live-verified 2026-09-05: {"FUZZ": "ZGVmYXVsdC5hc3A="}).
     """
     items: list[OutputItem] = []
     for line in stdout.splitlines():
@@ -335,18 +357,30 @@ def parse_ffuf_jsonl(stdout: str) -> list[OutputItem]:
         url = obj.get("url")
         if not url:
             continue
+        raw_input = (obj.get("input") or {}).get("FUZZ")
+        decoded = _b64_or_raw(raw_input)
         items.append(OutputItem(
             kind="finding", value=str(url),
             evidence={
                 "source": "ffuf",
                 "vuln": "content-discovery",
                 "status": obj.get("status"),
-                "input": obj.get("input"),
+                "input": decoded,
                 "length": obj.get("length"),
                 "words": obj.get("words"),
             },
         ))
     return items
+
+
+def _b64_or_raw(value) -> object:
+    """Base64-decode ffuf's input values; pass through on failure."""
+    if not isinstance(value, str):
+        return value
+    try:
+        return base64.b64decode(value).decode("utf-8", "replace")
+    except Exception:
+        return value
 
 
 PARSERS: dict[str, Callable[[str], list[OutputItem]]] = {
@@ -361,6 +395,7 @@ PARSERS: dict[str, Callable[[str], list[OutputItem]]] = {
     "assetfinder": parse_assetfinder,
     "amass": parse_amass,
     "ffuf": parse_ffuf_jsonl,  # v0.4: real JSONL parser (was raw)
+    "subjack": parse_subjack,  # v0.5: [+] lines → takeover items (was raw)
     "tlsx": parse_tlsx,
     "dalfox": parse_dalfox,
     "kxss": parse_kxss,
@@ -388,16 +423,19 @@ def _tool_outputs(
         <workdir>/<stage>/<host>/<tool>.<ts_ms>.jsonl       (parsed items)
         <workdir>/<stage>/<host>/<tool>.<ts_ms>.cmd.txt     (cmd + meta)
     Directories are created on demand by the caller.
+
+    NOTE: names are built explicitly — Path.with_suffix() would REPLACE
+    the .<ts_ms> suffix (info-loss bug: re-runs overwrote prior outputs).
     """
     safe_host = _safe_host(host)
     out_dir = workdir / stage / safe_host
     out_dir.mkdir(parents=True, exist_ok=True)
-    base = out_dir / f"{tool}.{ts_ms}"
+    base = f"{tool}.{ts_ms}"
     return {
-        "stdout": base.with_suffix(".stdout.txt"),
-        "stderr": base.with_suffix(".stderr.txt"),
-        "jsonl": base.with_suffix(".jsonl"),
-        "cmd": base.with_suffix(".cmd.txt"),
+        "stdout": out_dir / f"{base}.stdout.txt",
+        "stderr": out_dir / f"{base}.stderr.txt",
+        "jsonl": out_dir / f"{base}.jsonl",
+        "cmd": out_dir / f"{base}.cmd.txt",
     }
 
 
@@ -411,8 +449,13 @@ def _write_outputs(
     duration_s: float,
     exit_code: int,
     timed_out: bool,
+    stdin: Optional[str] = None,
 ) -> None:
-    """Persist the four files for a single tool invocation."""
+    """Persist the four files for a single tool invocation.
+
+    stdin is recorded in the cmd meta so every invocation is fully
+    reproducible (inputs are information too).
+    """
     paths["stdout"].write_text(stdout, encoding="utf-8", errors="replace")
     paths["stderr"].write_text(stderr, encoding="utf-8", errors="replace")
     with open(paths["jsonl"], "w", encoding="utf-8") as f:
@@ -422,6 +465,7 @@ def _write_outputs(
             }, ensure_ascii=False) + "\n")
     meta = {
         "cmd": cmd,
+        "stdin": stdin,
         "duration_s": duration_s,
         "exit_code": exit_code,
         "timed_out": timed_out,
@@ -618,6 +662,7 @@ class Runner:
                     duration_s=duration,
                     exit_code=exit_code,
                     timed_out=timed_out,
+                    stdin=stdin,
                 )
                 output_path = str(paths["jsonl"])
             except Exception:
@@ -846,6 +891,7 @@ class Runner:
                     duration_s=duration,
                     exit_code=exit_code,
                     timed_out=timed_out,
+                    stdin=stdin,
                 )
                 output_path = str(paths["jsonl"])
             except Exception:

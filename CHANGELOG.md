@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.5.0 — 2026-09-05
+
+Tier-1 optimization pass: same coverage in a fraction of the requests,
+plus per-host fanout and screenshots. Guiding rule: raw pools are
+append-only — normalization only shapes *tool inputs*, nothing is
+ever dropped from storage, events, or attribution maps.
+
+### New features
+
+- **URL normalization** (`normalize_urls`, `scan_pool`) — collapse key
+  `(host, path, param-names)`: param-value variants, pagination, and
+  http/https dupes become one representative (https > has-query >
+  shortest, deterministic). 15k gau URLs → hundreds of targets.
+  `url_variants` map kept in extras for finding attribution.
+- **Per-host fanout** — ffuf, naabu, and gowitness now iterate every
+  known live host (root first, busiest next), each with its own
+  invocation, output dir, and events. Previously only the pipeline
+  root was fuzzed/scanned (live-verified hole on vulnweb).
+- **gowitness screenshots** — new `screenshot` stage
+  (`scan file -f`, Playwright-chromium auto-detected via
+  `_chrome_path()`, `LOOM_CHROME_PATH` override), wired into
+  `full`/`deep`/`web`. Shots persist under `screenshots/<host>/`.
+- **Archive-URL mining moved earlier** — gau/waybackurls need only the
+  domain, so they run alongside resolve/probe instead of after probe
+  (~60s off the critical path). XSS nodes now also wait for probe so
+  probe-discovered URLs are never missed.
+- **stdin persisted** — every invocation's stdin lands in the
+  `.cmd.txt` meta. Full reproducibility of inputs, not just outputs.
+- **Real subjack parser** — `[+]` lines become `takeover` items in the
+  eventlog/jsonl (stage return values alone never reach the eventlog,
+  which had made takeovers invisible to `loom findings`).
+
+### Bugs fixed
+
+- **ffuf `-s -json` combo** — `-s` silently suppresses JSON output
+  (plain matched words instead), which zeroed EVERY ffuf finding.
+  Now `-json -noninteractive` (both verified live).
+- **ffuf b64 inputs** — `input.FUZZ` values are base64-encoded;
+  decoded for evidence.
+- **Output filename collision** — `{tool}.{ts}` + `with_suffix()`
+  replaced the timestamp, so re-runs overwrote prior outputs.
+  Filenames are now explicit (`tool.<ts>.stdout.txt`, ...).
+- **naabu/ffuf rooted at pipeline root only** — see per-host fanout.
+- **Chrome Safe Browsing vs vuln targets** (environmental, documented):
+  Chrome refuses flagged hosts (`ERR_BLOCKED_BY_CLIENT` on testasp);
+  gowitness exposes no override — those hosts yield no shots on any
+  Chrome-based tool.
+
 ## v0.4.2 — 2026-09-04
 
 Eight new tool stages, two new pipelines, findings/sweeps subcommands,

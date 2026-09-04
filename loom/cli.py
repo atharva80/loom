@@ -396,9 +396,10 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
         make_assetfinder_stage, make_dnsx_stage, make_httpx_stage,
         make_katana_stage, make_nuclei_stage, make_subfinder_stage,
         make_alterx_stage, make_crlfuzz_stage, make_dalfox_stage,
-        make_ffuf_stage, make_gau_stage, make_hakrawler_stage,
-        make_kxss_stage, make_naabu_stage, make_subjack_stage,
-        make_tlsx_stage, make_uncover_stage, make_waybackurls_stage,
+        make_ffuf_stage, make_gau_stage, make_gowitness_stage,
+        make_hakrawler_stage, make_kxss_stage, make_naabu_stage,
+        make_subjack_stage, make_tlsx_stage, make_uncover_stage,
+        make_waybackurls_stage,
     )
     from .live import LiveLogger
     from .pipeline import StageFn
@@ -494,11 +495,18 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             should_run=lambda s: (s.from_node("katana", "url")
                                   + s.from_node("hakrawler", "url")) > 0,
         ))
+        # v0.5: screenshot crawled hosts as evidence.
+        dag.add(Node(
+            id="screenshot", depends_on=["katana", "hakrawler"],
+            should_run=lambda s: (s.from_node("katana", "url")
+                                  + s.from_node("hakrawler", "url")) > 0,
+        ))
         stages = {
             "catchall": _make_catchall_stage(log, catchall_mod),
             "katana": make_katana_stage(),
             "hakrawler": make_hakrawler_stage(),
             "nuclei": make_nuclei_stage(),
+            "screenshot": make_gowitness_stage(),
         }
         return dag, stages
 
@@ -559,31 +567,35 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
         ))
         dag.add(Node(
-            id="urls", depends_on=["probe"],
-            should_run=lambda s: s.from_node("probe", "url") > 0,
+            id="urls", depends_on=["resolve"],
+            should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
         ))
         dag.add(Node(
-            id="urls_gau", depends_on=["probe"],
-            should_run=lambda s: s.from_node("probe", "url") > 0,
+            id="urls_gau", depends_on=["resolve"],
+            should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
         ))
         dag.add(Node(
-            id="xss", depends_on=["urls", "urls_gau"],
+            id="xss", depends_on=["probe", "urls", "urls_gau"],
             should_run=lambda s: (s.from_node("urls", "url")
                                   + s.from_node("urls_gau", "url")
                                   + s.from_node("probe", "url")) > 0,
         ))
         dag.add(Node(
-            id="xss_kxss", depends_on=["urls", "urls_gau"],
+            id="xss_kxss", depends_on=["probe", "urls", "urls_gau"],
             should_run=lambda s: (s.from_node("urls", "url")
                                   + s.from_node("urls_gau", "url")) > 0,
         ))
         dag.add(Node(
-            id="xss_crlfuzz", depends_on=["urls", "urls_gau"],
+            id="xss_crlfuzz", depends_on=["probe", "urls", "urls_gau"],
             should_run=lambda s: (s.from_node("urls", "url")
                                   + s.from_node("urls_gau", "url")) > 0,
         ))
         dag.add(Node(
             id="scan", inputs={"url"}, depends_on=["probe", "urls", "urls_gau"],
+            should_run=lambda s: s.from_node("probe", "url") > 0,
+        ))
+        dag.add(Node(
+            id="screenshot", depends_on=["probe"],
             should_run=lambda s: s.from_node("probe", "url") > 0,
         ))
         stages = {
@@ -597,6 +609,7 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             "xss_kxss": make_kxss_stage(),
             "xss_crlfuzz": make_crlfuzz_stage(),
             "scan": make_nuclei_stage(),
+            "screenshot": make_gowitness_stage(),
         }
         return dag, stages
 
@@ -639,26 +652,26 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
         ))
         dag.add(Node(
-            id="urls", depends_on=["probe"],
-            should_run=lambda s: s.from_node("probe", "url") > 0,
+            id="urls", depends_on=["resolve"],
+            should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
         ))
         dag.add(Node(
-            id="urls_gau", depends_on=["probe"],
-            should_run=lambda s: s.from_node("probe", "url") > 0,
+            id="urls_gau", depends_on=["resolve"],
+            should_run=lambda s: s.from_node("resolve", "subdomain") > 0,
         ))
         dag.add(Node(
-            id="xss", depends_on=["urls", "urls_gau"],
+            id="xss", depends_on=["probe", "urls", "urls_gau"],
             should_run=lambda s: (s.from_node("urls", "url")
                                   + s.from_node("urls_gau", "url")
                                   + s.from_node("probe", "url")) > 0,
         ))
         dag.add(Node(
-            id="xss_kxss", depends_on=["urls", "urls_gau"],
+            id="xss_kxss", depends_on=["probe", "urls", "urls_gau"],
             should_run=lambda s: (s.from_node("urls", "url")
                                   + s.from_node("urls_gau", "url")) > 0,
         ))
         dag.add(Node(
-            id="xss_crlfuzz", depends_on=["urls", "urls_gau"],
+            id="xss_crlfuzz", depends_on=["probe", "urls", "urls_gau"],
             should_run=lambda s: (s.from_node("urls", "url")
                                   + s.from_node("urls_gau", "url")) > 0,
         ))
@@ -672,6 +685,10 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
         ))
         dag.add(Node(
             id="scan", inputs={"url"}, depends_on=["probe", "urls", "urls_gau"],
+            should_run=lambda s: s.from_node("probe", "url") > 0,
+        ))
+        dag.add(Node(
+            id="screenshot", depends_on=["probe"],
             should_run=lambda s: s.from_node("probe", "url") > 0,
         ))
         stages = {
@@ -691,6 +708,7 @@ def _build_pipeline(name: str, log, catchall_mod, runner_cls):
             "takeover": make_subjack_stage(),
             "fuzz": make_ffuf_stage(),
             "scan": make_nuclei_stage(),
+            "screenshot": make_gowitness_stage(),
         }
         return dag, stages
 

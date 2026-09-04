@@ -48,7 +48,7 @@ loom validate
 loom run example.com --pipeline catchall              # classify (1 stage, ~2s)
 loom run example.com --pipeline subdomain             # subenum → resolve → probe → vulnscan (+ urls)
 loom run example.com --pipeline web                   # catchall → katana ∥ hakrawler → scan
-loom run example.com --pipeline full                  # subenum → resolve → probe ∥ urls → xss fanout ∥ scan
+loom run example.com --pipeline full                  # subenum → resolve → probe ∥ urls → xss fanout ∥ scan ∥ screenshots
 loom run example.com --pipeline deep                  # full + portscan, tls-SAN, uncover, permute, takeover, fuzz
 
 # Multi-host fanout (drive hundreds of subs in parallel)
@@ -226,8 +226,10 @@ fan-out of nuclei can't blow past 20GB.
   `ffuf`, `gau`, `waybackurls`, `assetfinder`, `amass` (any missing tool is
   non-fatal — `loom validate` reports what's available)
 - Optional (used by the `full`/`deep` pipelines): `uncover`, `tlsx`,
-  `dalfox`, `crlfuzz`, `kxss`, `hakrawler`, `subjack`, `alterx`
-  (missing optional tools are skipped or gated by the preflight check)
+  `dalfox`, `crlfuzz`, `kxss`, `hakrawler`, `subjack`, `alterx`,
+  `gowitness` (missing optional tools are skipped or gated by the
+  preflight check; gowitness needs a Chrome binary — Playwright's
+  bundled chromium is auto-detected, override with LOOM_CHROME_PATH)
 
 ---
 

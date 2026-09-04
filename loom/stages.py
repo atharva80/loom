@@ -22,9 +22,11 @@ locate them (the Runner raises FileNotFoundError → exit 127 if missing).
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qsl, urlsplit
 
 from .pipeline import PipelineContext, StageFn
 from .runner import OutputItem, Runner, _safe_host as _safe_name
@@ -52,6 +54,7 @@ DEFAULT_BIN = {
     "hakrawler": "hakrawler",
     "subjack": "subjack",
     "alterx": "alterx",
+    "gowitness": "gowitness",
 }
 
 
@@ -215,15 +218,26 @@ def naabu_command(host: str, *, bin_path: str = "naabu",
 
 
 def make_naabu_stage(*, bin_path: Optional[str] = None, ports: str = "100",
-                     timeout: float = 180.0) -> StageFn:
+                     timeout: float = 180.0,
+                     max_hosts: int = 20) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
-        cmd = naabu_command(host, bin_path=bin_path or DEFAULT_BIN["naabu"],
-                            ports=ports, timeout=timeout)
-        result = runner.run(
-            "naabu", cmd, stage="portscan", host=host,
-            parser="naabu", timeout=timeout, check=True,
-        )
-        return result.items
+        # Port-scan every known live host, not just the pipeline root
+        # (live-verified coverage hole: the deep run scanned only
+        # vulnweb.com while testasp/testaspnet/rest went unscanned).
+        # Each host gets its own invocation (own output dir + events).
+        targets = [h.split(":")[0] for h in _live_hosts(ctx, host)][:max_hosts]
+        if not targets:
+            targets = [host]
+        items: list[OutputItem] = []
+        for target in targets:
+            cmd = naabu_command(target, bin_path=bin_path or DEFAULT_BIN["naabu"],
+                                ports=ports, timeout=timeout)
+            result = runner.run(
+                "naabu", cmd, stage="portscan", host=target,
+                parser="naabu", timeout=timeout, check=True,
+            )
+            items.extend(result.items)
+        return items
     return _stage
 
 
@@ -298,13 +312,16 @@ def _tech_tags(tech: set[str]) -> Optional[str]:
 
 def make_nuclei_stage(*, bin_path: Optional[str] = None,
                       severity: str = "critical,high,medium",
-                      timeout: float = 600.0) -> StageFn:
+                      timeout: float = 600.0,
+                      max_urls: int = 2000) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
-        # Scan the URLs collected by earlier stages when available
-        # (ctx.extras["urls"]), else the host. Focus templates on the
-        # detected tech stack when fingerprinting produced one.
+        # Scan the NORMALIZED URL pool when available (param-value
+        # variants and pagination collapse — same attack surface,
+        # fraction of the requests), else the host. Focus templates on
+        # the detected tech stack when fingerprinting produced one.
+        # The raw pool is untouched; variants map kept for attribution.
         tags = _tech_tags(ctx.extras.get("tech", set()))
-        urls = ctx.extras.get("urls")
+        urls = scan_pool(ctx, cap=max_urls)
         if urls:
             cmd = nuclei_command(urls, bin_path=bin_path or DEFAULT_BIN["nuclei"],
                                  severity=severity, timeout=timeout, tags=tags)
@@ -450,10 +467,11 @@ _FFUF_MINI_WORDLIST = "admin\nbackup\ndev\ndb.sql\nphpinfo.php\ntest\n.git\n.env
 
 def make_ffuf_stage(*, bin_path: Optional[str] = None,
                     wordlist: Optional[str] = None,
-                    timeout: float = 300.0) -> StageFn:
+                    timeout: float = 180.0,
+                    max_hosts: int = 10) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
         nonlocal wordlist
-        url = host if host.startswith(("http://", "https://")) else f"https://{host}"
+        host = _bare_host(host)
         if not wordlist:
             for cand in _FFUF_WORDLIST_CANDIDATES:
                 if Path(cand).is_file():
@@ -468,18 +486,31 @@ def make_ffuf_stage(*, bin_path: Optional[str] = None,
                 wl.parent.mkdir(parents=True, exist_ok=True)
                 wl.write_text(_FFUF_MINI_WORDLIST, encoding="utf-8")
                 wordlist = str(wl)
-        cmd = [
-            bin_path or DEFAULT_BIN["ffuf"],
-            "-u", f"{url}/FUZZ",
-            "-w", wordlist,
-            "-s", "-json",
-            "-mc", "200,201,204,301,302,307,401,403,405",
-        ]
-        result = runner.run(
-            "ffuf", cmd, stage="fuzz", host=host,
-            parser="ffuf", timeout=timeout, check=True,
-        )
-        return result.items
+        # Fuzz every known live host, not just the pipeline root
+        # (live-verified coverage hole: the deep run fuzzed only
+        # vulnweb.com's root, which exposes no common paths, while the
+        # live app hosts went unfuzzed). Root first, busiest hosts
+        # next; each host gets its own invocation + output dir.
+        items: list[OutputItem] = []
+        for h in _live_hosts(ctx, host)[:max_hosts]:
+            target = _target_for(ctx, h)
+            # NOTE: -json WITHOUT -s. Live-verified 2026-09-05: -s
+            # (silent) suppresses the JSON and prints plain matched
+            # words, which silently zeroed every ffuf finding.
+            # -noninteractive keeps it non-TTY-safe instead.
+            cmd = [
+                bin_path or DEFAULT_BIN["ffuf"],
+                "-u", f"{target}/FUZZ",
+                "-w", wordlist,
+                "-json", "-noninteractive",
+                "-mc", "200,201,204,301,302,307,401,403,405",
+            ]
+            result = runner.run(
+                "ffuf", cmd, stage="fuzz", host=h,
+                parser="ffuf", timeout=timeout, check=True,
+            )
+            items.extend(result.items)
+        return items
     return _stage
 
 
@@ -558,20 +589,143 @@ def dalfox_command(url: str, *, bin_path: str = "dalfox",
 def _xss_pool(urls: list[str], *, cap: int = 500) -> list[str]:
     """Build the URL list for xss fanout stages (dalfox/kxss/crlfuzz).
 
-    Live-verified lesson (2026-09-04): feeding the full 15k-URL gau
-    pool to dalfox ground the stage for minutes. Parameterized URLs
-    (the only ones XSS tools can actually test) go first; the list is
-    capped so a huge archive dump can't stall the pipeline.
+    Normalizes first (param-value variants collapse — ?q=1 and ?q=2
+    test identically), then puts parameterized URLs first (the only
+    ones XSS tools can actually test), then caps so a huge archive
+    dump can't stall the pipeline.
+
+    The raw pool is never touched: normalization only shapes tool
+    input. Every raw URL stays in ctx.extras['urls'], the eventlog,
+    and the variants map.
     """
-    seen: set[str] = set()
-    params: list[str] = []
-    plain: list[str] = []
-    for u in urls:
-        if u in seen:
-            continue
-        seen.add(u)
-        (params if "?" in u else plain).append(u)
+    reps, _ = normalize_urls(urls)
+    params = [u for u in reps if "?" in u]
+    plain = [u for u in reps if "?" not in u]
     return (params + plain)[:cap]
+
+
+def normalize_urls(urls: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+    """Collapse URL variants to one representative per attack surface.
+
+    Key = (host[:port], path, sorted query-param NAMES). Collapsed:
+    same path with different param values (?q=1 vs ?q=2), pagination
+    (?page=1..500), http/https scheme duplicates. NEVER dropped as a
+    class: every distinct host, path, param-set, and static asset
+    (.js/.css/...) survives — JS is secret-scan fuel.
+
+    Returns (representatives in first-seen order, {rep: [all variants]}).
+    Pure function: the input list is never mutated.
+    """
+    groups: dict[tuple, list[str]] = {}
+    order: list[tuple] = []
+    for u in urls:
+        try:
+            p = urlsplit(u)
+        except ValueError:
+            continue
+        host = (p.netloc or "").lower()
+        if not host:
+            continue
+        try:
+            names = tuple(sorted({k for k, _ in parse_qsl(p.query, keep_blank_values=True)}))
+        except ValueError:
+            names = ()
+        key = (host, p.path or "/", names)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        if u not in groups[key]:
+            groups[key].append(u)
+
+    reps: list[str] = []
+    variants: dict[str, list[str]] = {}
+    for key in order:
+        vs = groups[key]
+        # Representative preference: https > has-query > shortest >
+        # lexicographic (fully deterministic).
+        rep = min(vs, key=lambda v: (
+            not v.lower().startswith("https://"),
+            "?" not in v,
+            len(v),
+            v,
+        ))
+        reps.append(rep)
+        variants[rep] = list(vs)
+    return reps, variants
+
+
+def scan_pool(ctx: PipelineContext, *, cap: int = 2000) -> list[str]:
+    """Normalized URL list for breadth scanners (nuclei).
+
+    Same collapse as the xss pool but in first-seen order with a
+    roomier cap. Records the variants map in extras for finding
+    attribution. The raw `urls` pool is left intact.
+    """
+    urls = ctx.extras.get("urls") or []
+    reps, variants = normalize_urls(urls)
+    ctx.extras["url_variants"] = variants
+    return reps[:cap]
+
+
+def _bare_host(host: str) -> str:
+    """Strip scheme/path: 'https://a.com/x' → 'a.com'. Idempotent."""
+    h = host.strip()
+    if "://" in h:
+        try:
+            netloc = urlsplit(h).netloc or h
+        except ValueError:
+            netloc = h
+        h = netloc.split("@")[-1].split(":")[0]
+    return h.lower().rstrip("/")
+
+
+def _live_hosts(ctx: PipelineContext, host: str) -> list[str]:
+    """Live-host set for per-host fanout (ffuf/naabu/gowitness).
+
+    Union of the pipeline root, probed URL hosts, and resolved subs —
+    root first, then by URL frequency, then alphabetical. Default ports
+    are stripped; non-default ports are kept (they're distinct
+    surfaces). Pure expansion: never drops a known host.
+    """
+    host = _bare_host(host)
+    counts: dict[str, int] = {}
+    for u in ctx.extras.get("urls") or []:
+        try:
+            p = urlsplit(u)
+        except ValueError:
+            continue
+        netloc = (p.netloc or "").lower()
+        if not netloc:
+            continue
+        if "@" in netloc:  # strip userinfo
+            netloc = netloc.rsplit("@", 1)[1]
+        bare, _, port = netloc.partition(":")
+        default = (p.scheme == "http" and port == "80") or (
+            p.scheme == "https" and port == "443")
+        key = bare if (not port or default) else f"{bare}:{port}"
+        if bare:
+            counts[key] = counts.get(key, 0) + 1
+    for s in ctx.extras.get("resolved_subs") or []:
+        s = str(s).lower().strip()
+        if s:
+            counts.setdefault(s, 0)
+    ordered = sorted(counts, key=lambda h: (-counts[h], h))
+    out = [host.lower()]
+    out.extend(h for h in ordered if h != host.lower())
+    return out
+
+
+def _target_for(ctx: PipelineContext, host: str) -> str:
+    """Preferred base URL for a host: the first probed URL's
+    scheme://host (preserves http-vs-https reality), else https."""
+    for u in ctx.extras.get("urls") or []:
+        try:
+            p = urlsplit(u)
+        except ValueError:
+            continue
+        if (p.netloc or "").lower() == host.lower() and p.scheme in ("http", "https"):
+            return f"{p.scheme}://{p.netloc}"
+    return f"https://{host}"
 
 
 def make_dalfox_stage(*, bin_path: Optional[str] = None,
@@ -702,16 +856,9 @@ def make_subjack_stage(*, bin_path: Optional[str] = None,
                               timeout=timeout)
         result = runner.run(
             "subjack", cmd, stage="takeover", host=host,
-            parser="raw", timeout=timeout, check=True,
+            parser="subjack", timeout=timeout, check=True,
         )
-        items: list[OutputItem] = []
-        for it in result.items:
-            if it.kind == "raw" and "[+]" in it.value:
-                items.append(OutputItem(
-                    kind="takeover", value=it.value.strip(),
-                    evidence={"source": "subjack", "target": it.value},
-                ))
-        return items
+        return result.items
     return _stage
 
 
@@ -748,4 +895,103 @@ def make_alterx_stage(*, bin_path: Optional[str] = None,
             if it.kind == "subdomain" and it.value not in subs:
                 subs.append(it.value)
         return result.items
+    return _stage
+
+
+# ============================================================
+# gowitness — screenshots of live hosts (evidence capture)
+# ============================================================
+
+
+def _chrome_path() -> Optional[str]:
+    """Resolve a usable Chrome binary for gowitness.
+
+    Preference: LOOM_CHROME_PATH override → Playwright's bundled
+    chromium (live-verified working headless 2026-09-05) → system
+    chromium-browser → snap chromium. Returns None if nothing found
+    (gowitness then falls back to downloading its own, which needs
+    network + cache perms).
+    """
+    cands = [
+        os.environ.get("LOOM_CHROME_PATH", ""),
+        str(Path.home() / ".cache/ms-playwright/chromium-1234"
+            / "chrome-linux64/chrome"),
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+    ]
+    for c in cands:
+        if c and Path(c).is_file() and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def gowitness_command(targets_file: Path | str, shot_dir: Path | str, *,
+                      bin_path: str = "gowitness",
+                      chrome_path: Optional[str] = None,
+                      threads: int = 4,
+                      timeout: float = 600.0) -> list[str]:
+    """gowitness scan file -f <targets> -s <shotdir> (batch mode).
+
+    Live-verified 2026-09-05 against public-firing-range: writes one
+    .jpeg per target into shot_dir with -q --write-stdout.
+    """
+    cmd = [
+        bin_path, "scan", "file", "-f", str(targets_file),
+        "-s", str(shot_dir), "-q", "--write-stdout",
+        "-t", str(threads),
+    ]
+    if chrome_path:
+        cmd += ["--chrome-path", chrome_path]
+    return cmd
+
+
+def _screenshots_in(shot_dir: Path) -> list[Path]:
+    """Screenshot files under a dir (deterministic order)."""
+    if not shot_dir.is_dir():
+        return []
+    return sorted(
+        p for p in shot_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in (".png", ".jpeg", ".jpg")
+    )
+
+
+def make_gowitness_stage(*, bin_path: Optional[str] = None,
+                         timeout: float = 600.0,
+                         max_hosts: int = 25,
+                         threads: int = 4) -> StageFn:
+    async def _stage(runner: Runner, host: str, ctx: PipelineContext):
+        # Screenshot every known live host (root first). Shots persist
+        # under screenshots/<host>/; one screenshot item per file is
+        # returned for DAG counts (the raw run event records the
+        # invocation itself, per the single-emitter rule).
+        # LIMITATION (live 2026-09-05): Chrome Safe Browsing refuses to
+        # render flagged vuln targets (ERR_BLOCKED_BY_CLIENT on
+        # testasp.vulnweb.com) and gowitness exposes no override flag —
+        # those hosts yield no shots on ANY chrome-based tool.
+        host = _bare_host(host)
+        targets = [_target_for(ctx, h)
+                   for h in _live_hosts(ctx, host)][:max_hosts]
+        if not targets:
+            return []
+        base = runner.workdir or ctx.workdir or Path.cwd()
+        tdir = base / "inputs" / _safe_name(host)
+        tdir.mkdir(parents=True, exist_ok=True)
+        tfile = tdir / "gowitness-targets.txt"
+        tfile.write_text("\n".join(targets), encoding="utf-8")
+        shot_dir = base / "screenshots" / _safe_name(host)
+        shot_dir.mkdir(parents=True, exist_ok=True)
+        cmd = gowitness_command(
+            tfile, shot_dir,
+            bin_path=bin_path or DEFAULT_BIN["gowitness"],
+            chrome_path=_chrome_path(), threads=threads, timeout=timeout,
+        )
+        runner.run(
+            "gowitness", cmd, stage="screenshot", host=host,
+            parser="raw", timeout=timeout, check=True,
+        )
+        return [
+            OutputItem(kind="screenshot", value=str(p),
+                       evidence={"source": "gowitness", "host": host})
+            for p in _screenshots_in(shot_dir)
+        ]
     return _stage

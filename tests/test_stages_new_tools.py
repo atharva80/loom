@@ -102,8 +102,9 @@ class TestCommandBuilders:
 
 
 class TestWordlistResolution:
+    # Real ffuf -json shape (live 2026-09-05): input values are b64.
     FFUF_JSONL = ('{"url": "https://example.com/admin", "status": 200, '
-                  '"length": 123, "words": 20, "input": {"FUZZ": "admin"}}')
+                  '"length": 123, "words": 20, "input": {"FUZZ": "YWRtaW4="}}')
 
     def _fake_ffuf(self, tmp_path, monkeypatch):
         import os
@@ -134,6 +135,7 @@ class TestWordlistResolution:
         assert len(items) == 1
         assert items[0].kind == "finding"
         assert items[0].value == "https://example.com/admin"
+        assert items[0].evidence["input"] == "admin"  # b64-decoded
 
     def test_ffuf_wordlist_missing_dir_creates_one(self, tmp_path, monkeypatch):
         """No candidate exists → stage writes a minimal built-in
@@ -329,14 +331,16 @@ class TestNewParsers:
     def test_xss_pool_caps_and_prefers_params(self):
         """Live-verified (2026-09-04): the xss fanout received the full
         15k-URL gau pool and dalfox ground for minutes. _xss_pool()
-        prefers parameterized URLs and caps the list."""
-        from loom.stages import _xss_pool
+        normalizes (same-key param variants collapse), prefers
+        parameterized URLs, and caps the list."""
+        from loom.stages import _xss_pool, normalize_urls
         plain = [f"https://a.com/{i}" for i in range(300)]
         params = [f"https://a.com/s?q={i}" for i in range(10)]
         pool = _xss_pool(plain + params, cap=100)
         assert len(pool) == 100
-        assert all(u in pool for u in params)   # param URLs survive the cap
-        assert pool[:10] == params              # and come first
+        assert pool[0] == "https://a.com/s?q=0"  # param rep sorts first
+        _, variants = normalize_urls(params)
+        assert len(variants["https://a.com/s?q=0"]) == 10  # none lost
 
     def test_parse_dalfox_jsonl(self):
         out = ('{"vuln":"XSS","url":"https://a.com/?q=x","severity":"High"}\n'
