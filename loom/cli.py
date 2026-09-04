@@ -1076,6 +1076,98 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0 if not missing else 1
 
 
+DIFF_TYPES = ("subdomain", "url", "host", "finding", "takeover")
+
+
+def _run_artifact_sets(workdir: Path, run_id: int
+                       ) -> tuple[dict[str, set], dict[tuple, dict]]:
+    """Read a run's events.jsonl into per-type {(value, source)} sets
+    plus a detail map for findings/takeovers. Missing file → empty."""
+    sets: dict[str, set] = {t: set() for t in DIFF_TYPES}
+    detail: dict[tuple, dict] = {}
+    try:
+        lines = (workdir / f"run-{run_id}" / "events.jsonl").read_text(
+            encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return sets, detail
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        t = ev.get("type")
+        if t not in sets:
+            continue
+        key = (str(ev.get("value")), str(ev.get("source") or "?"))
+        sets[t].add(key)
+        if t in ("finding", "takeover"):
+            detail.setdefault(key, {
+                "value": key[0], "source": key[1],
+                "severity": (ev.get("evidence") or {}).get("severity"),
+            })
+    return sets, detail
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    """Run-over-run delta for overnight triage.
+
+    Compares two runs' eventlogs (default: newest two) and reports
+    added/removed subdomains, urls, hosts, findings, takeovers.
+    Exit 0 on a completed comparison (even with changes); 1 on error.
+    """
+    workdir = Path(args.workdir).expanduser()
+    if not workdir.exists():
+        print(f"workdir {workdir} does not exist", file=sys.stderr)
+        return 1
+    db_path = workdir / "loom.sqlite"
+    if not db_path.exists():
+        print("no runs found (no loom.sqlite)", file=sys.stderr)
+        return 1
+    with State(db_path) as st:
+        runs = st.list_runs(domain=getattr(args, "domain", None))
+    if getattr(args, "from_run", None) is not None and getattr(args, "to_run", None) is not None:
+        from_id, to_id = args.from_run, args.to_run
+        ids = {r["id"] for r in runs}
+        if from_id not in ids or to_id not in ids:
+            print(f"run {from_id} or {to_id} not found", file=sys.stderr)
+            return 1
+    else:
+        if len(runs) < 2:
+            print("need two runs to compare", file=sys.stderr)
+            return 1
+        to_id, from_id = runs[0]["id"], runs[1]["id"]
+    old_sets, _ = _run_artifact_sets(workdir, from_id)
+    new_sets, new_detail = _run_artifact_sets(workdir, to_id)
+    added = {t: sorted(new_sets[t] - old_sets[t]) for t in DIFF_TYPES}
+    removed = {t: sorted(old_sets[t] - new_sets[t]) for t in DIFF_TYPES}
+
+    def _fmt(key):
+        d = new_detail.get(key, {"value": key[0], "source": key[1]})
+        return d
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "from": from_id, "to": to_id,
+            "added": {t: ([_fmt(k) for k in added[t]] if t in ("finding", "takeover")
+                           else [k[0] for k in added[t]])
+                      for t in DIFF_TYPES},
+            "removed": {t: [k[0] for k in removed[t]] for t in DIFF_TYPES},
+        }, indent=2, default=str))
+        return 0
+    print(f"loom diff — run {from_id} → run {to_id}")
+    any_change = False
+    for t in DIFF_TYPES:
+        for v, _s in added[t]:
+            print(f"  + [{t}] {v}")
+            any_change = True
+        for v, _s in removed[t]:
+            print(f"  - [{t}] {v}")
+            any_change = True
+    if not any_change:
+        print("  no changes")
+    return 0
+
+
 # ============================================================
 # Argument parsing
 # ============================================================
@@ -1310,6 +1402,19 @@ def build_parser() -> argparse.ArgumentParser:
     pf.add_argument("--json", action="store_true",
                     help="emit findings as a JSON array")
     pf.set_defaults(func=cmd_findings)
+
+    # diff — run-over-run delta for overnight triage
+    pd = sub.add_parser("diff",
+                        help="compare two runs (added/removed artifacts)")
+    pd.add_argument("--from", dest="from_run", type=int, default=None,
+                    help="older run id (default: second-newest)")
+    pd.add_argument("--to", dest="to_run", type=int, default=None,
+                    help="newer run id (default: newest)")
+    pd.add_argument("--domain", default=None,
+                    help="restrict default newest-two selection to a domain")
+    pd.add_argument("--json", action="store_true",
+                    help="emit the delta as JSON (agent-readable)")
+    pd.set_defaults(func=cmd_diff)
 
     # status-server — minimal live run-status web page
     pss = sub.add_parser("status-server",

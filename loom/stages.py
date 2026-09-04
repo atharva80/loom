@@ -88,7 +88,7 @@ def make_subfinder_stage(*, bin_path: Optional[str] = None,
         # `host` here is the target domain (e.g. "example.com").
         cmd = subfinder_command(host, bin_path=bin_path or DEFAULT_BIN["subfinder"],
                                 timeout=timeout)
-        result = runner.run(
+        result = await runner.run(
             "subfinder", cmd, stage="subenum", host=host,
             parser=parser, timeout=timeout, check=True,
         )
@@ -127,7 +127,7 @@ def make_dnsx_stage(*, bin_path: Optional[str] = None,
             "-silent", "-resp",
             "-l", "-",
         ]
-        result = runner.run_streaming(
+        result = await runner.run_streaming(
             "dnsx", cmd, stage="resolve", host=host,
             parser="dnsx", timeout=timeout, check=True,
             stdin="\n".join(subs),
@@ -175,7 +175,7 @@ def make_httpx_stage(*, bin_path: Optional[str] = None,
         if subs:
             cmd = httpx_command(subs, bin_path=bin_path or DEFAULT_BIN["httpx"],
                                 timeout=timeout)
-            result = runner.run(
+            result = await runner.run(
                 "httpx", cmd, stage="probe", host=host,
                 parser="httpx", timeout=timeout, check=True,
                 stdin="\n".join(subs),
@@ -184,7 +184,7 @@ def make_httpx_stage(*, bin_path: Optional[str] = None,
             url = host if host.startswith(("http://", "https://")) else f"https://{host}"
             cmd = httpx_command(url, bin_path=bin_path or DEFAULT_BIN["httpx"],
                                 timeout=timeout)
-            result = runner.run(
+            result = await runner.run(
                 "httpx", cmd, stage="probe", host=host,
                 parser="httpx", timeout=timeout, check=True,
             )
@@ -237,7 +237,7 @@ def make_naabu_stage(*, bin_path: Optional[str] = None, ports: str = "100",
         for target in targets:
             cmd = naabu_command(target, bin_path=bin_path or DEFAULT_BIN["naabu"],
                                 ports=ports, timeout=timeout)
-            result = runner.run(
+            result = await runner.run(
                 "naabu", cmd, stage="portscan", host=target,
                 parser="naabu", timeout=timeout, check=True,
             )
@@ -330,7 +330,7 @@ def make_nuclei_stage(*, bin_path: Optional[str] = None,
         if urls:
             cmd = nuclei_command(urls, bin_path=bin_path or DEFAULT_BIN["nuclei"],
                                  severity=severity, timeout=timeout, tags=tags)
-            result = runner.run_streaming(
+            result = await runner.run_streaming(
                 "nuclei", cmd, stage="scan", host=host,
                 parser="nuclei", timeout=timeout, check=True,
                 stdin="\n".join(urls),
@@ -339,7 +339,7 @@ def make_nuclei_stage(*, bin_path: Optional[str] = None,
             target = host if host.startswith(("http://", "https://")) else f"https://{host}"
             cmd = nuclei_command(target, bin_path=bin_path or DEFAULT_BIN["nuclei"],
                                  severity=severity, timeout=timeout, tags=tags)
-            result = runner.run_streaming(
+            result = await runner.run_streaming(
                 "nuclei", cmd, stage="scan", host=host,
                 parser="nuclei", timeout=timeout, check=True,
             )
@@ -366,7 +366,7 @@ def make_katana_stage(*, bin_path: Optional[str] = None, depth: int = 2,
         target = host if host.startswith(("http://", "https://")) else f"https://{host}"
         cmd = katana_command(target, bin_path=bin_path or DEFAULT_BIN["katana"],
                              depth=depth, timeout=timeout)
-        result = runner.run_streaming(
+        result = await runner.run_streaming(
             "katana", cmd, stage="crawl", host=host,
             parser="katana", timeout=timeout, check=True,
         )
@@ -388,7 +388,7 @@ def make_assetfinder_stage(*, bin_path: Optional[str] = None,
                            timeout: float = 30.0) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
         cmd = [bin_path or DEFAULT_BIN["assetfinder"], "--subs-only", host]
-        result = runner.run(
+        result = await runner.run(
             "assetfinder", cmd, stage="subenum", host=host,
             parser="assetfinder", timeout=timeout, check=True,
         )
@@ -405,7 +405,7 @@ def make_waybackurls_stage(*, bin_path: Optional[str] = None,
                            timeout: float = 120.0) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
         cmd = [bin_path or DEFAULT_BIN["waybackurls"], host]
-        result = runner.run(
+        result = await runner.run(
             "waybackurls", cmd, stage="urls", host=host,
             parser="waybackurls", timeout=timeout, check=True,
         )
@@ -423,7 +423,7 @@ def make_gau_stage(*, bin_path: Optional[str] = None,
                    timeout: float = 120.0) -> StageFn:
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
         cmd = [bin_path or DEFAULT_BIN["gau"], "--subs", host]
-        result = runner.run(
+        result = await runner.run(
             "gau", cmd, stage="urls", host=host,
             parser="gau", timeout=timeout, check=True,
         )
@@ -465,7 +465,7 @@ def make_amass_stage(*, bin_path: Optional[str] = None,
             wl = str(hit) if hit else None
         cmd = amass_command(host, bin_path=bin_path or DEFAULT_BIN["amass"],
                             brute=brute, wordlist=wl, timeout=timeout)
-        result = runner.run(
+        result = await runner.run(
             "amass", cmd, stage="subenum", host=host,
             parser="amass", timeout=timeout, check=True,
         )
@@ -548,7 +548,7 @@ def make_ffuf_stage(*, bin_path: Optional[str] = None,
                 "-json", "-noninteractive",
                 "-mc", "200,201,204,301,302,307,401,403,405",
             ]
-            result = runner.run(
+            result = await runner.run(
                 "ffuf", cmd, stage="fuzz", host=h,
                 parser="ffuf", timeout=timeout, check=True,
             )
@@ -575,7 +575,7 @@ def make_uncover_stage(*, bin_path: Optional[str] = None,
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
         cmd = uncover_command(host, bin_path=bin_path or DEFAULT_BIN["uncover"],
                               timeout=timeout)
-        result = runner.run(
+        result = await runner.run(
             "uncover", cmd, stage="subenum", host=host,
             parser="subfinder", timeout=timeout, check=True,
         )
@@ -604,7 +604,7 @@ def make_tlsx_stage(*, bin_path: Optional[str] = None,
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
         cmd = tlsx_command(host, bin_path=bin_path or DEFAULT_BIN["tlsx"],
                            timeout=timeout)
-        result = runner.run(
+        result = await runner.run(
             "tlsx", cmd, stage="tls", host=host,
             parser="tlsx", timeout=timeout, check=True,
         )
@@ -780,7 +780,7 @@ def make_dalfox_stage(*, bin_path: Optional[str] = None,
             return []
         cmd = dalfox_command(pool[0], bin_path=bin_path or DEFAULT_BIN["dalfox"],
                              timeout=timeout)
-        result = runner.run_streaming(
+        result = await runner.run_streaming(
             "dalfox", cmd, stage="xss", host=host,
             parser="dalfox", timeout=timeout, check=True,
             stdin="\n".join(pool),
@@ -814,7 +814,7 @@ def make_crlfuzz_stage(*, bin_path: Optional[str] = None,
         list_path.parent.mkdir(parents=True, exist_ok=True)
         list_path.write_text("\n".join(urls), encoding="utf-8")
         cmd = [bin_path or DEFAULT_BIN["crlfuzz"], "-l", str(list_path), "-s"]
-        result = runner.run(
+        result = await runner.run(
             "crlfuzz", cmd, stage="xss", host=host,
             parser="kxss", timeout=timeout, check=True,
         )
@@ -841,7 +841,7 @@ def make_kxss_stage(*, bin_path: Optional[str] = None,
         urls = [u for u in _xss_pool(raw, cap=max_urls) if "?" in u]
         if not urls:
             return []
-        result = runner.run_streaming(
+        result = await runner.run_streaming(
             "kxss", ["kxss"], stage="xss", host=host,
             parser="kxss", timeout=timeout, check=True,
             stdin="\n".join(urls),
@@ -867,7 +867,7 @@ def make_hakrawler_stage(*, bin_path: Optional[str] = None, depth: int = 2,
         target = host if host.startswith(("http://", "https://")) else f"https://{host}"
         cmd = hakrawler_command(target, bin_path=bin_path or DEFAULT_BIN["hakrawler"],
                                 depth=depth, timeout=timeout)
-        result = runner.run_streaming(
+        result = await runner.run_streaming(
             "hakrawler", cmd, stage="crawl", host=host,
             parser="katana", timeout=timeout, check=True,
             stdin=f"{target}\n",
@@ -897,7 +897,7 @@ def make_subjack_stage(*, bin_path: Optional[str] = None,
     async def _stage(runner: Runner, host: str, ctx: PipelineContext):
         cmd = subjack_command(host, bin_path=bin_path or DEFAULT_BIN["subjack"],
                               timeout=timeout)
-        result = runner.run(
+        result = await runner.run(
             "subjack", cmd, stage="takeover", host=host,
             parser="subjack", timeout=timeout, check=True,
         )
@@ -925,7 +925,7 @@ def make_alterx_stage(*, bin_path: Optional[str] = None,
         # Cap permutations: live-verified 2026-09-04 — alterx happily
         # generated 109,705 perms from 190 subs and starved the dnsx
         # resolve stage. -limit N bounds output at the source.
-        result = runner.run_streaming(
+        result = await runner.run_streaming(
             "alterx", ["alterx", "-silent", "-limit", str(max_perms)],
             stage="permute", host=host,
             parser="alterx", timeout=timeout, check=True,
@@ -1028,7 +1028,7 @@ def make_gowitness_stage(*, bin_path: Optional[str] = None,
             bin_path=bin_path or DEFAULT_BIN["gowitness"],
             chrome_path=_chrome_path(), threads=threads, timeout=timeout,
         )
-        runner.run(
+        await runner.run(
             "gowitness", cmd, stage="screenshot", host=host,
             parser="raw", timeout=timeout, check=True,
         )
@@ -1097,7 +1097,7 @@ def make_arjun_stage(*, bin_path: Optional[str] = None,
             cmd = arjun_command(
                 target, out, bin_path=bin_path or DEFAULT_BIN["arjun"],
                 threads=threads, wordlist=wl)
-            result = runner.run(
+            result = await runner.run(
                 "arjun", cmd, stage="params", host=host,
                 parser="raw", timeout=timeout, check=True,
             )
@@ -1196,7 +1196,7 @@ def make_jssecrets_stage(*, bin_path: Optional[str] = None,
         items: list[OutputItem] = []
         # 1. gitleaks over the directory (exit-code forced 0: leaks
         #    are findings, not failures).
-        gl = runner.run(
+        gl = await runner.run(
             "gitleaks",
             [gitleaks_bin or DEFAULT_BIN["gitleaks"], "detect",
              "--source", str(jsdir), "--no-git",
@@ -1212,7 +1212,7 @@ def make_jssecrets_stage(*, bin_path: Optional[str] = None,
         urls = ctx.extras.setdefault("urls", [])
         params = ctx.extras.setdefault("urls_params", [])
         for src_url, path in fetched:
-            ju = runner.run_streaming(
+            ju = await runner.run_streaming(
                 "jsluice",
                 [jsluice_bin or DEFAULT_BIN["jsluice"], "urls", str(path)],
                 stage="jssecrets", host=host,
@@ -1229,7 +1229,7 @@ def make_jssecrets_stage(*, bin_path: Optional[str] = None,
                 if "?" in abs_url and abs_url not in params:
                     params.append(abs_url)
         # 3. jsluice secret mining → findings.
-        js = runner.run_streaming(
+        js = await runner.run_streaming(
             "jsluice",
             [jsluice_bin or DEFAULT_BIN["jsluice"], "secrets", *files],
             stage="jssecrets", host=host,
@@ -1294,7 +1294,7 @@ def make_asnmap_stage(*, bin_path: Optional[str] = None,
         host = _bare_host(host)
         cmd = asnmap_command(host, bin_path=bin_path or DEFAULT_BIN["asnmap"],
                              timeout=timeout)
-        result = runner.run(
+        result = await runner.run(
             "asnmap", cmd, stage="asn", host=host,
             parser="asnmap", timeout=timeout, check=True,
         )

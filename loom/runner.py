@@ -23,6 +23,7 @@ a partial result if a parser is registered for it.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -30,7 +31,6 @@ import os
 import re
 import shlex
 import signal
-import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -712,7 +712,7 @@ class Runner:
         # across concurrent fanout hosts.
         self.ram_budget = ram_budget
 
-    def run(
+    async def run(
         self,
         tool: str,
         cmd: list[str],
@@ -726,7 +726,11 @@ class Runner:
         check: bool = True,
         stdin: Optional[str] = None,
     ) -> RunResult:
-        """Run a tool synchronously. Returns RunResult.
+        """Run a tool. Returns RunResult.
+
+        v0.8: fully async (asyncio subprocess). The old blocking
+        subprocess.run held the event-loop thread, so one long stage
+        starved its entire DAG level (live: amass-brute, 15 min).
 
         - `parser`: name of the registered parser (default: tool name).
         - `check`: if True, raises ToolBlocked when scope forbids the tool.
@@ -759,9 +763,9 @@ class Runner:
             self.ram_budget.acquire(tool)
             budget_reserved = True
 
-        # throttle
+        # throttle (async: never block the event loop)
         if self.rate_limiter is not None:
-            self.rate_limiter.acquire(timeout=timeout)
+            await self.rate_limiter.aacquire(timeout=timeout)
 
         # inject scope headers
         full_cmd = _inject_headers(list(cmd), self.scope.request_headers())
@@ -776,29 +780,15 @@ class Runner:
 
         t0 = time.monotonic()
         try:
-            proc = subprocess.run(
-                full_cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+            proc = await asyncio.create_subprocess_exec(
+                *full_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=(asyncio.subprocess.PIPE
+                       if stdin is not None else None),
                 cwd=cwd,
                 env=env,
-                input=stdin,
             )
-            duration = time.monotonic() - t0
-            stdout = proc.stdout or ""
-            stderr = proc.stderr or ""
-            exit_code = proc.returncode
-            timed_out = False
-            error = _classify_error(exit_code, stderr, timed_out)
-        except subprocess.TimeoutExpired as e:
-            duration = time.monotonic() - t0
-            stdout = (e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or ""))
-            stderr = (e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or ""))
-            exit_code = -1
-            error = _classify_error(exit_code, stderr, timed_out=True)
-            timed_out = True
-            tool_failed(self.log, stage, host, tool, error)
         except FileNotFoundError as e:
             duration = time.monotonic() - t0
             err = f"binary not found: {e}"
@@ -809,6 +799,34 @@ class Runner:
                 tool=tool, command=full_cmd, exit_code=127, duration_s=duration,
                 items=[], error=err,
             )
+        try:
+            out_b, err_b = await asyncio.wait_for(
+                proc.communicate(
+                    input=stdin.encode("utf-8") if stdin is not None else None),
+                timeout=timeout,
+            )
+            duration = time.monotonic() - t0
+            stdout = out_b.decode("utf-8", "replace") if out_b else ""
+            stderr = err_b.decode("utf-8", "replace") if err_b else ""
+            exit_code = proc.returncode if proc.returncode is not None else -1
+            timed_out = False
+            error = _classify_error(exit_code, stderr, timed_out)
+        except asyncio.TimeoutError:
+            duration = time.monotonic() - t0
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                out_b, err_b = await proc.communicate()
+            except Exception:
+                out_b, err_b = b"", b""
+            stdout = out_b.decode("utf-8", "replace") if out_b else ""
+            stderr = err_b.decode("utf-8", "replace") if err_b else ""
+            exit_code = -1
+            error = _classify_error(exit_code, stderr, timed_out=True)
+            timed_out = True
+            tool_failed(self.log, stage, host, tool, error)
 
         try:
             parser_name = parser or tool
@@ -885,7 +903,7 @@ class Runner:
             timed_out=timed_out,
         )
 
-    def run_streaming(
+    async def run_streaming(
         self,
         tool: str,
         cmd: list[str],
@@ -902,6 +920,8 @@ class Runner:
         """Run a tool and stream items to `on_item` as they are parsed line by line.
         This is what makes the DAG streaming work: katana can start feeding nuclei
         before the crawl finishes.
+
+        v0.8: fully async like run() (same event-loop-starvation fix).
         """
         if check and not self.scope.is_tool_allowed(tool):
             raise ToolBlocked(f"tool {tool!r} blocked by scope {self.scope.name!r}")
@@ -926,7 +946,7 @@ class Runner:
             budget_reserved = True
 
         if self.rate_limiter is not None:
-            self.rate_limiter.acquire(timeout=timeout)
+            await self.rate_limiter.aacquire(timeout=timeout)
 
         full_cmd = _inject_headers(list(cmd), self.scope.request_headers())
         env = os.environ.copy()
@@ -936,10 +956,14 @@ class Runner:
 
         t0 = time.monotonic()
         try:
-            proc = subprocess.Popen(
-                full_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE if stdin is not None else None,
-                text=True, cwd=cwd, env=env,
+            proc = await asyncio.create_subprocess_exec(
+                *full_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=(asyncio.subprocess.PIPE
+                       if stdin is not None else None),
+                cwd=cwd,
+                env=env,
             )
         except FileNotFoundError as e:
             err = f"binary not found: {e}"
@@ -951,19 +975,31 @@ class Runner:
                 items=[], error=err,
             )
 
+        # Feed stdin from a background task while we read stdout: writing
+        # the whole input before reading (the old blocking order) deadlocks
+        # as soon as input + output both exceed the 64K pipe buffers.
+        # BrokenPipe = child exited early (e.g. dnsx); ignore, as before.
+        feed_task = None
         if stdin is not None and proc.stdin is not None:
-            try:
-                proc.stdin.write(stdin)
-            except BrokenPipeError:
-                # Child closed stdin early (e.g. dnsx exited before
-                # consuming all subdomains). Ignore — the child
-                # decided it had enough input.
-                pass
-            finally:
+            stdin_data = stdin.encode("utf-8")
+
+            async def _feed() -> None:
+                assert proc.stdin is not None
                 try:
-                    proc.stdin.close()
-                except OSError:
+                    proc.stdin.write(stdin_data)
+                    await proc.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError):
+                    # Child closed stdin early (e.g. dnsx exited before
+                    # consuming all subdomains). Ignore — the child
+                    # decided it had enough input.
                     pass
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except OSError:
+                        pass
+
+            feed_task = asyncio.create_task(_feed())
 
         items: list[OutputItem] = []
         parser_name = parser or tool
@@ -986,50 +1022,67 @@ class Runner:
         per_line = line_parsers.get(parser_name)
 
         deadline = t0 + timeout
+        stream_timed_out = False
         try:
-            if per_line is not None:
-                assert proc.stdout is not None
-                for raw_line in proc.stdout:
-                    now = time.monotonic()
-                    if now > deadline:
-                        proc.kill()
-                        raise subprocess.TimeoutExpired(cmd=full_cmd, timeout=timeout)
-                    line = raw_line.rstrip("\n")
-                    # Keep the raw line (WITH newline) in the buffer so
-                    # the saved .stdout.txt / full_stdout stays intact —
-                    # stripping here glued every URL together when the
-                    # workdir writer joined the buffer (found live:
-                    # katana output on help.twilio.com).
-                    stdout_buf.append(raw_line)
-                    val = per_line(line)
-                    if val:
-                        item = OutputItem(kind=("subdomain" if parser_name in ("subfinder", "assetfinder", "amass") else ("url" if parser_name in ("katana", "gau", "waybackurls") else "port")),
-                                          value=val, evidence={"source": tool})
-                        items.append(item)
-                        if self.eventlog is not None:
-                            self.eventlog.append(type=item.kind, source=tool, host=host, value=item.value, evidence=item.evidence, stage=stage)
-                        if on_item is not None:
-                            on_item(item)
-            else:
-                # accumulate and parse at end
-                assert proc.stdout is not None
-                for raw_line in proc.stdout:
-                    if time.monotonic() > deadline:
-                        proc.kill()
-                        raise subprocess.TimeoutExpired(cmd=full_cmd, timeout=timeout)
-                    stdout_buf.append(raw_line)
+            assert proc.stdout is not None
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    stream_timed_out = True
+                    break
+                try:
+                    raw_b = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=deadline - now)
+                except asyncio.TimeoutError:
+                    stream_timed_out = True
+                    break
+                if not raw_b:
+                    break  # EOF
+                raw_line = raw_b.decode("utf-8", "replace")
+                # Keep the raw line (WITH newline) in the buffer so
+                # the saved .stdout.txt / full_stdout stays intact —
+                # stripping here glued every URL together when the
+                # workdir writer joined the buffer (found live:
+                # katana output on help.twilio.com).
+                stdout_buf.append(raw_line)
+                if per_line is None:
+                    continue  # accumulate; parse at end
+                val = per_line(raw_line.rstrip("\n"))
+                if val:
+                    item = OutputItem(kind=("subdomain" if parser_name in ("subfinder", "assetfinder", "amass") else ("url" if parser_name in ("katana", "gau", "waybackurls") else "port")),
+                                      value=val, evidence={"source": tool})
+                    items.append(item)
+                    if self.eventlog is not None:
+                        self.eventlog.append(type=item.kind, source=tool, host=host, value=item.value, evidence=item.evidence, stage=stage)
+                    if on_item is not None:
+                        on_item(item)
         finally:
+            if stream_timed_out:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            if feed_task is not None:
+                try:
+                    await asyncio.wait_for(feed_task, timeout=10)
+                except (asyncio.TimeoutError, Exception):
+                    pass
             try:
-                stderr_buf.append(proc.stderr.read() if proc.stderr else "")
+                err_b = await proc.stderr.read() if proc.stderr else b""
+                if err_b:
+                    stderr_buf.append(err_b.decode("utf-8", "replace"))
             except Exception:
                 pass
-            proc.wait()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass
             # Release the RAM reservation once the process is gone.
             if budget_reserved and self.ram_budget is not None:
                 self.ram_budget.release(tool)
 
         duration = time.monotonic() - t0
-        timed_out = proc.returncode is None or (duration >= timeout and proc.returncode == -9)
+        timed_out = stream_timed_out or proc.returncode is None or (duration >= timeout and proc.returncode == -9)
         exit_code = proc.returncode if proc.returncode is not None else -1
         if per_line is None:
             full_stdout = "".join(stdout_buf)

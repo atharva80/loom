@@ -45,7 +45,7 @@ def fake_bins(tmp_path):
 
 
 class TestResolveTool:
-    def test_prefers_go_bin_over_shadowing_path(self, fake_bins, monkeypatch):
+    async def test_prefers_go_bin_over_shadowing_path(self, fake_bins, monkeypatch):
         go_dir, shadow_dir, make = fake_bins
         make("mytool", "projectdiscovery/mytool v1.0", go_dir)
         make("mytool", "Usage: mytool [OPTIONS] URL", shadow_dir)
@@ -62,7 +62,7 @@ class TestResolveTool:
         assert "shadow" not in resolved
         assert str(go_dir / "mytool") in resolved
 
-    def test_env_override_wins(self, fake_bins, monkeypatch):
+    async def test_env_override_wins(self, fake_bins, monkeypatch):
         """Env override is the first candidate for known shadowers,
         and it wins when it passes validation."""
         go_dir, shadow_dir, make = fake_bins
@@ -76,7 +76,7 @@ class TestResolveTool:
         resolved = tools.resolve_tool("httpx")
         assert resolved == str(shadow_dir / "httpx")
 
-    def test_shadow_only_path_still_resolves(self, fake_bins, monkeypatch, tmp_path):
+    async def test_shadow_only_path_still_resolves(self, fake_bins, monkeypatch, tmp_path):
         """If ONLY the shadow exists, resolve_tool falls back to it
         (better than nothing) but validate_report flags it."""
         go_dir, shadow_dir, make = fake_bins
@@ -90,7 +90,7 @@ class TestResolveTool:
         resolved = tools.resolve_tool("httpx")
         assert resolved == str(shadow_dir / "httpx")
 
-    def test_validate_report_flags_shadowed(self, fake_bins, monkeypatch):
+    async def test_validate_report_flags_shadowed(self, fake_bins, monkeypatch):
         go_dir, shadow_dir, make = fake_bins
         make("httpx", "projectdiscovery/httpx v1.6.0", go_dir)
         make("httpx", "Usage: httpx [OPTIONS] URL", shadow_dir)
@@ -104,12 +104,12 @@ class TestResolveTool:
         assert "shadow" not in str(path)  # resolved to the real one
         assert "shadow" in note.lower() or "warning" in note.lower()
 
-    def test_unknown_tool_returns_none(self, monkeypatch):
+    async def test_unknown_tool_returns_none(self, monkeypatch):
         tools._validate_cache.clear()
         monkeypatch.delenv("LOOM_TOOL_NOTAREALTOOL", raising=False)
         assert tools.resolve_tool("definitely-not-a-real-tool-xyz") is None
 
-    def test_path_miss_falls_back_to_go_bins(self, fake_bins, monkeypatch):
+    async def test_path_miss_falls_back_to_go_bins(self, fake_bins, monkeypatch):
         """Bug found live 2026-09-04: non-shadower tools installed in
         ~/go/bin but absent from PATH resolved to None. which() miss
         must fall back to GO_BIN_DIRS (keeping PATH precedence for
@@ -125,7 +125,7 @@ class TestResolveTool:
         assert resolved is not None
         assert str(go_dir / "vulnz") in resolved
 
-    def test_path_hit_still_wins_for_non_shadowers(self, fake_bins, monkeypatch):
+    async def test_path_hit_still_wins_for_non_shadowers(self, fake_bins, monkeypatch):
         """PATH precedence contract for non-shadowers is preserved when
         the tool IS on PATH (tests rely on user-controlled PATH)."""
         go_dir, shadow_dir, make = fake_bins
@@ -143,7 +143,7 @@ class TestResolveTool:
 
 
 class TestRunnerUsesResolvedBinary:
-    def test_runner_rewrites_cmd0_to_resolved_path(self, fake_bins, monkeypatch):
+    async def test_runner_rewrites_cmd0_to_resolved_path(self, fake_bins, monkeypatch):
         """The Runner must invoke the resolved binary, not the PATH
         shadow."""
         go_dir, shadow_dir, make = fake_bins
@@ -162,7 +162,7 @@ class TestRunnerUsesResolvedBinary:
         scope = scope_from_dict({"name": "t", "target": "example.com",
                                  "rate_limit_rps": 1000})
         runner = Runner(scope)
-        result = runner.run(
+        result = await runner.run(
             "mytool", ["mytool", "-silent", "-d", "example.com"],
             stage="subenum", parser="raw",
         )
@@ -170,7 +170,7 @@ class TestRunnerUsesResolvedBinary:
         assert "result=ok" in result.stdout_tail
         assert "SHADOWED" not in result.stdout_tail
 
-    def test_streaming_uses_resolved_binary(self, fake_bins, monkeypatch):
+    async def test_streaming_uses_resolved_binary(self, fake_bins, monkeypatch):
         go_dir, shadow_dir, make = fake_bins
         make("mytool", "result=ok\nline2", go_dir)
         make("mytool", "SHADOWED", shadow_dir)
@@ -184,7 +184,7 @@ class TestRunnerUsesResolvedBinary:
                                  "rate_limit_rps": 1000})
         runner = Runner(scope)
         items = []
-        result = runner.run_streaming(
+        result = await runner.run_streaming(
             "mytool", ["mytool", "-silent", "-d", "example.com"],
             stage="resolve", parser="raw",
             on_item=lambda it: items.append(it),

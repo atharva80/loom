@@ -18,7 +18,7 @@ def _runner(tmp_path):
     return Runner(scope=scope, workdir=tmp_path)
 
 
-def test_broken_pipe_on_stdin_does_not_fail(monkeypatch, tmp_path):
+async def test_broken_pipe_on_stdin_does_not_fail(monkeypatch, tmp_path):
     """A child that closes stdin immediately must not raise BrokenPipeError
     on the parent side."""
     # Create a fake tool that closes stdin immediately and outputs nothing.
@@ -31,7 +31,7 @@ def test_broken_pipe_on_stdin_does_not_fail(monkeypatch, tmp_path):
     stdin_payload = "a.example.com\n" * 1000
 
     runner = _runner(tmp_path)
-    result = runner.run(
+    result = await runner.run(
         "fast_eof", [str(fake)], stage="test", host="x",
         parser="raw", stdin=stdin_payload,
     )
@@ -40,7 +40,7 @@ def test_broken_pipe_on_stdin_does_not_fail(monkeypatch, tmp_path):
     assert result.error is None
 
 
-def test_normal_stdin_still_works(monkeypatch, tmp_path):
+async def test_normal_stdin_still_works(monkeypatch, tmp_path):
     """A normal stdin-consuming child must still get the full payload."""
     fake = tmp_path / "echo_tool"
     fake.write_text("#!/bin/sh\ncat\necho done\n")
@@ -49,7 +49,7 @@ def test_normal_stdin_still_works(monkeypatch, tmp_path):
     stdin_payload = "a.example.com\nb.example.com\nc.example.com\n"
 
     runner = _runner(tmp_path)
-    result = runner.run(
+    result = await runner.run(
         "echo", [str(fake)], stage="test", host="x",
         parser="raw", stdin=stdin_payload,
     )

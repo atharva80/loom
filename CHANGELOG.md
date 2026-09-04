@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.8.0 — 2026-09-05
+
+True-async runner: `Runner.run()` / `run_streaming()` are now coroutines
+backed by `asyncio` subprocesses. One long stage no longer starves its
+entire DAG level.
+
+- **The incident**: the deep-pipeline live run on vulnweb.com sat for
+  minutes with zero state rows, zero outputs, zero events while
+  amass-brute (15 min) ran — its level-mates (subfinder, assetfinder,
+  uncover) never started. Blocking `subprocess.run`/`Popen` held the
+  event-loop thread; `asyncio.gather` across a level only yields at
+  `await` points, and there were none during a 15-minute wait.
+- **The fix**: `asyncio.create_subprocess_exec` + `wait_for` timeouts +
+  async readline loop in both methods. stdin is fed from a background
+  task (the old write-everything-first order deadlocks past the 64K
+  pipe buffers when input and output are both large).
+- **Behavior changes** (both stricter-or-better, covered by tests):
+  `run_streaming` timeouts now return a proper timed-out `RunResult`
+  (state marked `timeout`, outputs written) instead of raising
+  `TimeoutExpired` out of the stage; all ~30 `stages.py` call sites
+  and every test now `await`s.
+- **Regression proof** (`tests/test_concurrency.py`): two `sleep 2`
+  stages behind `max_concurrency=2` finish in ~2s, not ~4s — for both
+  `run()` and `run_streaming()`.
+- **`loom diff <from> <to>`** (`--json`, `--types`): run-over-run delta
+  for overnight triage — new/lost subdomains, urls, hosts, findings,
+  takeovers, sourced from workdir artifacts + findings report.
+
 ## v0.7.1 — 2026-09-05
 
 Contract enforcement: the manifest schema ships in-repo and the

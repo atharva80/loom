@@ -47,11 +47,12 @@ class TestSingleEventWriter:
         monkeypatch.setenv("LOOM_TOOL_MYTOOL", str(fake))
 
         async def stage(runner, host, ctx):
-            return runner.run_streaming(
+            res = await runner.run_streaming(
                 "mytool", ["mytool", "-silent"],
                 stage="scan", host=host, parser="nuclei",
                 timeout=10,
-            ).items
+            )
+            return res.items
 
         dag = DAG().add(Node(id="scan", outputs={"finding"}))
         stages = {"scan": stage}
@@ -78,7 +79,7 @@ class TestSingleEventWriter:
         monkeypatch.setenv("LOOM_TOOL_KATANA", str(fake))
 
         runner = Runner(_scope(), workdir=tmp_path)
-        res = runner.run_streaming(
+        res = await runner.run_streaming(
             "katana", ["katana", "-u", "https://x.example.com"],
             stage="crawl", host="x.example.com", parser="katana",
             timeout=10,

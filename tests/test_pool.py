@@ -38,7 +38,7 @@ def _ctx():
 
 
 class TestNormalizeUrls:
-    def test_collapses_param_value_variants(self):
+    async def test_collapses_param_value_variants(self):
         urls = [f"https://a.com/s?q={i}" for i in range(50)]
         urls += [f"https://a.com/s?q={i}&page={i}" for i in range(50)]
         reps, variants = normalize_urls(urls)
@@ -48,7 +48,7 @@ class TestNormalizeUrls:
         flat = [u for vs in variants.values() for u in vs]
         assert sorted(flat) == sorted(urls)
 
-    def test_keeps_distinct_paths_hosts_and_static(self):
+    async def test_keeps_distinct_paths_hosts_and_static(self):
         urls = [
             "https://a.com/admin",
             "https://a.com/login",
@@ -66,7 +66,7 @@ class TestNormalizeUrls:
                      and "b.com" not in r][0]
         assert admin_rep.startswith("https://")
 
-    def test_representative_prefers_params_then_shortest(self):
+    async def test_representative_prefers_params_then_shortest(self):
         # Different param-name SETS are different surfaces: both kept.
         reps, _ = normalize_urls(["https://a.com/s", "https://a.com/s?q=1&r=2"])
         assert sorted(reps) == ["https://a.com/s", "https://a.com/s?q=1&r=2"]
@@ -77,10 +77,10 @@ class TestNormalizeUrls:
         assert sorted(variants["https://a.com/s?q=a"]) == [
             "https://a.com/s?q=a", "https://a.com/s?q=bbbb"]
 
-    def test_empty_in_empty_out(self):
+    async def test_empty_in_empty_out(self):
         assert normalize_urls([]) == ([], {})
 
-    def test_raw_pool_never_mutated(self):
+    async def test_raw_pool_never_mutated(self):
         urls = ["https://a.com/?x=1", "https://a.com/?x=2"]
         before = list(urls)
         normalize_urls(urls)
@@ -88,7 +88,7 @@ class TestNormalizeUrls:
 
 
 class TestScanPool:
-    def test_scan_pool_caps_but_keeps_raw(self):
+    async def test_scan_pool_caps_but_keeps_raw(self):
         ctx = _ctx()
         ctx.extras["urls"] = [f"https://a.com/p{i}?x=1" for i in range(100)]
         pool = scan_pool(ctx, cap=10)
@@ -96,10 +96,10 @@ class TestScanPool:
         assert len(ctx.extras["urls"]) == 100  # raw untouched
         assert "url_variants" in ctx.extras     # attribution preserved
 
-    def test_scan_pool_empty_without_urls(self):
+    async def test_scan_pool_empty_without_urls(self):
         assert scan_pool(_ctx()) == []
 
-    def test_xss_pool_still_prefers_params(self):
+    async def test_xss_pool_still_prefers_params(self):
         # 10 same-key param variants normalize to ONE rep (that's the
         # point) which still sorts first; nothing is lost.
         plain = [f"https://a.com/{i}" for i in range(300)]
@@ -113,7 +113,7 @@ class TestScanPool:
 
 
 class TestLiveHosts:
-    def test_extracts_hosts_root_first_by_frequency(self):
+    async def test_extracts_hosts_root_first_by_frequency(self):
         ctx = _ctx()
         ctx.extras["urls"] = [
             "http://b.com/x", "https://a.com/y", "http://b.com/z",
@@ -126,55 +126,55 @@ class TestLiveHosts:
         assert hosts.index("a.com") < hosts.index("c.com")
         assert "c.com" in hosts
 
-    def test_strips_default_ports_keeps_alt(self):
+    async def test_strips_default_ports_keeps_alt(self):
         ctx = _ctx()
         ctx.extras["urls"] = ["http://a.com:80/x", "https://b.com:8443/y"]
         hosts = _live_hosts(ctx, "root.com")
         assert "a.com" in hosts
         assert "b.com:8443" in hosts
 
-    def test_target_for_prefers_probed_scheme(self):
+    async def test_target_for_prefers_probed_scheme(self):
         ctx = _ctx()
         ctx.extras["urls"] = ["http://a.com/login", "https://b.com/"]
         assert _target_for(ctx, "a.com") == "http://a.com"
         assert _target_for(ctx, "b.com") == "https://b.com"
         assert _target_for(ctx, "unseen.com") == "https://unseen.com"
 
-    def test_bare_host_falls_back_to_root(self):
+    async def test_bare_host_falls_back_to_root(self):
         assert _live_hosts(_ctx(), "root.com") == ["root.com"]
 
 
 class TestStdinPersistence:
-    def test_cmd_meta_records_stdin(self, tmp_path: Path):
+    async def test_cmd_meta_records_stdin(self, tmp_path: Path):
         """Every invocation's stdin is persisted in the .cmd.txt meta —
         full reproducibility (the 'never lose info' rule for inputs)."""
         runner = Runner(_scope(), workdir=tmp_path)
-        runner.run("sh", ["sh", "-c", "cat"], stage="t", host="h",
+        await runner.run("sh", ["sh", "-c", "cat"], stage="t", host="h",
                    parser="raw", stdin="hello\nworld")
         metas = list(tmp_path.rglob("*.cmd.txt"))
         assert len(metas) == 1
         meta = json.loads(metas[0].read_text())
         assert meta["stdin"] == "hello\nworld"
 
-    def test_cmd_meta_stdin_null_when_none(self, tmp_path: Path):
+    async def test_cmd_meta_stdin_null_when_none(self, tmp_path: Path):
         runner = Runner(_scope(), workdir=tmp_path)
-        runner.run("sh", ["sh", "-c", "true"], stage="t", host="h",
+        await runner.run("sh", ["sh", "-c", "true"], stage="t", host="h",
                    parser="raw")
         meta = json.loads(next(tmp_path.rglob("*.cmd.txt")).read_text())
         assert meta["stdin"] is None
 
 
 class TestTimestampedOutputs:
-    def test_repeated_invocations_do_not_overwrite(self, tmp_path: Path):
+    async def test_repeated_invocations_do_not_overwrite(self, tmp_path: Path):
         """Live-theme bug: `{tool}.{ts}` + with_suffix('.cmd.txt')
         replaced the timestamp, so re-runs overwrote prior outputs.
         Filenames must keep the timestamp."""
         import time
         runner = Runner(_scope(), workdir=tmp_path)
-        runner.run("sh", ["sh", "-c", "echo one"], stage="t", host="h",
+        await runner.run("sh", ["sh", "-c", "echo one"], stage="t", host="h",
                    parser="raw")
         time.sleep(0.002)
-        runner.run("sh", ["sh", "-c", "echo two"], stage="t", host="h",
+        await runner.run("sh", ["sh", "-c", "echo two"], stage="t", host="h",
                    parser="raw")
         cmds = sorted(tmp_path.rglob("*.cmd.txt"))
         assert len(cmds) == 2
@@ -253,7 +253,7 @@ class TestPerHostFanout:
 
 
 class TestGowitnessStage:
-    def test_command_builder(self, tmp_path):
+    async def test_command_builder(self, tmp_path):
         from loom.stages import gowitness_command
         cmd = gowitness_command(tmp_path / "t.txt", tmp_path / "shots",
                                 chrome_path="/c/chrome", threads=2)
@@ -278,7 +278,7 @@ class TestGowitnessStage:
         assert items == []
         assert list(tmp_path.rglob("gowitness.*.cmd.txt"))
 
-    def test_screenshots_in_finds_images(self, tmp_path):
+    async def test_screenshots_in_finds_images(self, tmp_path):
         from loom.stages import _screenshots_in
         d = tmp_path / "shots"
         d.mkdir()

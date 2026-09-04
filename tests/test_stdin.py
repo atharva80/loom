@@ -27,7 +27,7 @@ def _make_fake(tmp_path: Path, name: str, script: str) -> Path:
 
 
 class TestRunnerStdin:
-    def test_run_passes_stdin(self, tmp_path, monkeypatch):
+    async def test_run_passes_stdin(self, tmp_path, monkeypatch):
         """cat with stdin: `cat -` echoes the input back."""
         fake = _make_fake(
             tmp_path, "cat",
@@ -35,7 +35,7 @@ class TestRunnerStdin:
         )
         monkeypatch.setenv("LOOM_TOOL_CAT", str(fake))
         runner = Runner(_scope())
-        res = runner.run(
+        res = await runner.run(
             "cat", ["cat", "-"], stage="manual", parser="raw",
             stdin="a.example.com\nb.example.com\n",
         )
@@ -43,7 +43,7 @@ class TestRunnerStdin:
         assert "a.example.com" in res.stdout_tail
         assert "b.example.com" in res.stdout_tail
 
-    def test_streaming_passes_stdin(self, tmp_path, monkeypatch):
+    async def test_streaming_passes_stdin(self, tmp_path, monkeypatch):
         fake = _make_fake(
             tmp_path, "cat",
             "cat -",
@@ -51,7 +51,7 @@ class TestRunnerStdin:
         monkeypatch.setenv("LOOM_TOOL_CAT", str(fake))
         runner = Runner(_scope())
         items = []
-        res = runner.run_streaming(
+        res = await runner.run_streaming(
             "cat", ["cat", "-"], stage="manual", parser="raw",
             on_item=items.append,
             stdin="x.example.com\n",

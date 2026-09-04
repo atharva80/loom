@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "loom"
-version = "0.7.1"
+version = "0.8.0"
 description = "Streaming DAG orchestrator for bug bounty recon (forked from reconftw)"
 requires-python = ">=3.10"
 dependencies = ["pyyaml"]

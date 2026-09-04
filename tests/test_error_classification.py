@@ -38,12 +38,12 @@ def _fake(name, content, chmod=0o755):
 
 # ---------- _classify_error unit tests ----------
 
-def test_classify_nonzero_exit_with_stderr():
+async def test_classify_nonzero_exit_with_stderr():
     err = _classify_error(exit_code=2, stderr="flag provided but not defined: -H\n")
     assert err == "exit code 2: flag provided but not defined: -H"
 
 
-def test_classify_nonzero_exit_no_stderr():
+async def test_classify_nonzero_exit_no_stderr():
     """The dnsx case: exit 2 but empty stderr must NOT produce empty error."""
     err = _classify_error(exit_code=2, stderr="")
     assert err is not None
@@ -51,54 +51,54 @@ def test_classify_nonzero_exit_no_stderr():
     assert "(no stderr output)" in err
 
 
-def test_classify_signal_kill():
+async def test_classify_signal_kill():
     err = _classify_error(exit_code=-9, stderr="")
     assert "killed by" in err
     assert "signal" in err or "SIG" in err
     assert "9" in err or "SIGKILL" in err
 
 
-def test_classify_timeout():
+async def test_classify_timeout():
     err = _classify_error(exit_code=-1, stderr="", timed_out=True)
     assert "timeout" in err
 
 
-def test_classify_success_is_none():
+async def test_classify_success_is_none():
     err = _classify_error(exit_code=0, stderr="")
     assert err is None
 
 
-def test_classify_stderr_truncated():
+async def test_classify_stderr_truncated():
     err = _classify_error(exit_code=1, stderr="x" * 2000)
     assert len(err) < 600  # truncated to ~500 chars + prefix
 
 
 # ---------- integration: Runner.run records the classified error ----------
 
-def test_run_records_error_on_nonzero_exit(runner, tmp_path):
+async def test_run_records_error_on_nonzero_exit(runner, tmp_path):
     """RunResult.error must carry the classified reason, not be empty."""
     fake = _fake(tmp_path / "failer", "#!/bin/sh\necho 'boom: bad flag' >&2\nexit 3\n")
-    res = runner.run("failer", [fake], stage="t", host="h", parser="raw")
+    res = await runner.run("failer", [fake], stage="t", host="h", parser="raw")
     assert res.exit_code == 3
     assert res.error is not None
     assert "exit code 3" in res.error
     assert "boom: bad flag" in res.error
 
 
-def test_run_records_signal_kill(runner, tmp_path):
+async def test_run_records_signal_kill(runner, tmp_path):
     """A tool killed by SIGKILL reports the signal info."""
     fake = _fake(tmp_path / "sigkiller",
                  "#!/bin/sh\nkill -9 $$\n", chmod=0o755)
-    res = runner.run("sigkiller", [fake], stage="t", host="h", parser="raw")
+    res = await runner.run("sigkiller", [fake], stage="t", host="h", parser="raw")
     assert res.exit_code < 0
     assert res.error is not None
     assert "killed" in res.error.lower()
 
 
-def test_run_records_timeout(runner, tmp_path):
+async def test_run_records_timeout(runner, tmp_path):
     """A timed-out tool reports 'timeout' in the error."""
     fake = _fake(tmp_path / "sleeper", "#!/bin/sh\nsleep 30\n")
-    res = runner.run("sleeper", [fake], stage="t", host="h",
+    res = await runner.run("sleeper", [fake], stage="t", host="h",
                      parser="raw", timeout=1)
     assert res.timed_out is True
     assert res.error is not None
