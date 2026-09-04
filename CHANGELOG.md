@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.4.2 — 2026-09-04
+
+Eight new tool stages, two new pipelines, findings/sweeps subcommands,
+and a preflight tool gate.
+
+### New features
+
+- **8 new tool stages** — uncover (search-engine asset discovery),
+  tlsx (TLS SAN/CN harvesting), dalfox (XSS), crlfuzz (CRLF injection),
+  kxss (reflected parameters), hakrawler (JS-aware crawler), subjack
+  (takeover checks), alterx (subdomain permutations). Real flags
+  verified against the installed binaries.
+- **`full` pipeline** — subenum → resolve → probe ∥ urls → xss fan-out
+  (dalfox ∥ kxss ∥ crlfuzz) ∥ nuclei scan.
+- **`deep` pipeline** — full + naabu portscan + tlsx + uncover +
+  alterx permute → re-resolve + subjack takeover + ffuf fuzz.
+- **`loom findings [--json]`** — cross-run aggregated findings report:
+  deduped on (value, source), severity-sorted, run provenance per row,
+  takeover events default to high severity.
+- **`loom sweeps --scopes-file F`** — overnight multi-scope wrapper
+  with a per-scope summary table and a non-zero exit if any scope
+  failed.
+- **Preflight required-tool gate** — runs refuse cleanly (exit 2) when
+  a pipeline's core binaries are unresolvable, instead of exit-127
+  storms mid-DAG.
+- **`urls`/`urls_gau` stages wired** — waybackurls + gau factories
+  existed since v0.2 but ran in no pipeline; now in `subdomain`,
+  `full`, and `deep`.
+- **ffuf real-JSONL parser** — JSONL output becomes finding items
+  (status, input, length, words).
+- **Wordlist auto-resolution** — ffuf falls back to SecLists on
+  boxes without `/usr/share/wordlists`, and finally to a built-in
+  mini wordlist written into the run's inputs dir.
+
+### Bugs fixed
+
+- **Binary resolution fallback** — non-shadower tools installed in
+  `~/go/bin` but absent from PATH resolved to None (1/12 → 11/12 on
+  the dev box). PATH precedence for hits is preserved.
+- **alterx permutation explosion** — uncapped alterx generated
+  109,705 permutations from 190 subs on vulnweb.com and starved the
+  dnsx resolve stage. Now `-limit 5000` by default (configurable).
+- **ffuf flags** — `-silent -noninteractive` are not real ffuf flags
+  (the binary just printed help). Now `-s -json`.
+- **Version drift** — pyproject said 0.1.0 while CHANGELOG was at
+  v0.3.0; a consistency test now locks them together.
+
 ## v0.3.0 — 2026-08-30
 
 First public-ready release. Full orchestrator with multi-host fanout,
