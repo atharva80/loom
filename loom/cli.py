@@ -1309,8 +1309,38 @@ def cmd_findings(args: argparse.Namespace) -> int:
         print("no runs found (no loom.sqlite)", file=sys.stderr)
         return 1
 
+    rows, run_domains = aggregate_findings(workdir)
+    if not rows:
+        print("no findings recorded yet", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2, default=str))
+        return 0
+
+    print(f"loom findings — {len(rows)} unique "
+          f"(from runs {min(run_domains) if run_domains else '-'}.."
+          f"{max(run_domains) if run_domains else '-'})")
+    print(f"  {'sev':<8} {'source':<10} {'host':<28} value")
+    for ev in rows:
+        runs = ",".join(map(str, ev["evidence"].get("runs", [])))
+        kind = (ev["evidence"].get("template_id")
+                or ev["evidence"].get("vuln")
+                or ev.get("type", "finding"))
+        print(f"  {ev['severity']:<8} {str(ev.get('source'))[:10]:<10} "
+              f"{str(ev.get('host'))[:28]:<28} {ev['value']}  "
+              f"[{kind}] runs={runs}")
+    return 0
+
+
+def aggregate_findings(workdir: Path) -> tuple[list[dict], dict[int, str]]:
+    """Pure aggregation behind cmd_findings (also serves the GUI).
+
+    Returns (severity-sorted rows, {run_id: domain}). Empty list when
+    nothing recorded yet (cmd_findings maps that to rc=1).
+    """
     run_domains: dict[int, str] = {}
-    with State(db_path) as st:
+    with State(workdir / "loom.sqlite") as st:
         for r in st.list_runs():
             run_domains[r["id"]] = r.get("domain") or "?"
 
@@ -1352,30 +1382,10 @@ def cmd_findings(args: argparse.Namespace) -> int:
                         not in (None, "", "info"):
                     prev["severity"] = ev["evidence"]["severity"].lower()
 
-    if not merged:
-        print("no findings recorded yet", file=sys.stderr)
-        return 1
-
     rows = sorted(merged.values(),
                   key=lambda e: (sev_order.get(e["severity"], 9),
                                  str(e.get("host", "")), str(e.get("value"))))
-    if getattr(args, "json", False):
-        print(json.dumps(rows, indent=2, default=str))
-        return 0
-
-    print(f"loom findings — {len(rows)} unique "
-          f"(from runs {min(run_domains) if run_domains else '-'}.."
-          f"{max(run_domains) if run_domains else '-'})")
-    print(f"  {'sev':<8} {'source':<10} {'host':<28} value")
-    for ev in rows:
-        runs = ",".join(map(str, ev["evidence"].get("runs", [])))
-        kind = (ev["evidence"].get("template_id")
-                or ev["evidence"].get("vuln")
-                or ev.get("type", "finding"))
-        print(f"  {ev['severity']:<8} {str(ev.get('source'))[:10]:<10} "
-              f"{str(ev.get('host'))[:28]:<28} {ev['value']}  "
-              f"[{kind}] runs={runs}")
-    return 0
+    return rows, run_domains
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1505,6 +1515,14 @@ def build_parser() -> argparse.ArgumentParser:
     pss.add_argument("--port", type=int, default=8080)
     pss.set_defaults(func=_cmd_status_server)
 
+    # gui — interactive web console (launch runs, live view, outputs)
+    pg = sub.add_parser("gui",
+                        help="serve the interactive web console "
+                             "(launch runs, live progress, outputs)")
+    pg.add_argument("--port", type=int, default=8080,
+                    help="port to listen on (default: 8080)")
+    pg.set_defaults(func=_cmd_gui)
+
     return p
 
 
@@ -1516,6 +1534,11 @@ def _cmd_status_server(args: argparse.Namespace) -> int:
                    or str(DEFAULT_WORKDIR)).expanduser()
     serve(workdir, args.port)
     return 0
+
+
+def _cmd_gui(args: argparse.Namespace) -> int:
+    from .webgui import cmd_gui
+    return cmd_gui(args)
 
 
 def main(argv: Optional[list[str]] = None) -> int:

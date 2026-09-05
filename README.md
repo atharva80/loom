@@ -75,6 +75,9 @@ loom findings --workdir ~/bbdata --json
 loom diff --workdir ~/bbdata --json                    # newest two runs
 loom diff --workdir ~/bbdata --from 1 --to 2 --types finding,subdomain
 
+# Web console: point, click, run — live progress, logs, outputs
+loom --workdir ~/bbdata gui --port 8080                # open http://127.0.0.1:8080
+
 # Wordlists (AssetNote, tech-gated fuzz — see loom/wordlists.py)
 # setup once: download from https://wordlists.assetnote.io/data/*.json
 # manifests into /opt/tools/wordlists/assetnote, then create the stable

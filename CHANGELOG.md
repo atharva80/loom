@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.9.0 — 2026-09-05
+
+Web console: `loom gui` — run scans from the browser.
+
+- **What**: `loom gui [--port 8080]` (workdir from global
+  `--workdir`, 127.0.0.1 only, stdlib only). Launch form (domain,
+  pipeline, scope, mode, concurrency) + raw `loom ...` command bar
+  (run/resume/sweeps + read commands; gui/server/nesting rejected).
+  Live executions with streaming logs + group-kill, live runs/stages
+  (incl. errors), findings browser, per-run file browser.
+- **How**: runs execute as supervised subprocesses of the same loom
+  install (real logs, process-group kill, scope gate enforced
+  server-side); browser polls JSON. File reads jailed to the run
+  dir (`..` rejected).
+- **Reuse, not duplication**: `snapshot()` for state,
+  `aggregate_findings()` (newly extracted pure helper, behavior
+  unchanged) for findings.
+- **Proof**: `tests/test_webgui.py` (13: page, validation, command
+  gate, traversal jail, kill); live: form-launched catchall → done
+  rc=0, kill mid-run → rc=-9, zero orphans.
+
 ## v0.8.11 — 2026-09-05
 
 Status page surfaces stage errors; snapshot() pinned by tests.
