@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.10.0 — 2026-09-05
+
+Console becomes a monitoring + autonomy UI (zero-dep visuals).
+
+- **Autopilot**: paste targets, pick quick/standard/deep, one click
+  runs a scope-gated sweep (2h per-scope cap). Minimal input,
+  maximal autonomous concurrency underneath.
+- **Live DAG per run**: level-laid-out SVG (status-colored nodes,
+  edges), click any stage for its tool table incl. errors. Served
+  from the real pipeline definition + live state rows.
+- **Overview strip**: run counts, findings total + severity donut
+  (SVG arcs), events/min activity sparkline (canvas).
+- **Robustness**: `serve_forever` port-in-use exits 2 with a clear
+  message (no traceback).
+- **Proof**: endpoint tests (autopilot spawn/validation, DAG shape,
+  port-in-use); live deep DAG (6 levels, 21 nodes, true states) +
+  live 2-target autopilot sweep.
+
 ## v0.9.0 — 2026-09-05
 
 Web console: `loom gui` — run scans from the browser.

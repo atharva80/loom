@@ -29,6 +29,11 @@ LOG_FULL_CAP = 500_000
 FILE_CAP = 200_000
 FILES_CAP = 2000
 FINDINGS_CAP = 500
+AUTOPILOT_TIMEOUT = 7200  # default per-scope cap for autopilot sweeps
+
+# intensity → pipeline for autopilot
+AUTOPILOT_PIPELINES = {"quick": "catchall", "standard": "full",
+                       "deep": "deep"}
 
 # Commands the browser may execute (no nesting, no shell).
 RUN_FAMILY = {"cmd_run", "cmd_resume", "cmd_sweeps"}
@@ -100,6 +105,50 @@ class GuiState:
             ids = sorted(self.execs)
         return [self.poll(i) for i in ids]
 
+    def overview(self) -> dict:
+        """Cheap rollup for the console header: run counts by status,
+        findings by severity (cached 15s — aggregation walks every
+        events file)."""
+        from .cli import aggregate_findings
+        now = time.monotonic()
+        with self.lock:
+            cached = self._overview_cache if hasattr(self, "_overview_cache") else None
+        if cached and now - cached[0] < 15:
+            return cached[1]
+        try:
+            import sqlite3 as _sq
+            db = self.workdir / "loom.sqlite"
+            by_status: dict[str, int] = {}
+            total = 0
+            if db.exists():
+                con = _sq.connect(str(db))
+                try:
+                    for st, n in con.execute(
+                            "SELECT CASE WHEN finished_at IS NULL THEN "
+                            "'running' ELSE 'done' END, COUNT(*) FROM runs "
+                            "GROUP BY 1"):
+                        by_status[st] = n
+                        total += n
+                finally:
+                    con.close()
+        except Exception:
+            by_status, total = {}, 0
+        sev: dict[str, int] = {}
+        if (self.workdir / "loom.sqlite").exists():
+            try:
+                rows, _ = aggregate_findings(self.workdir)
+                for r in rows:
+                    s = str(r.get("severity") or "info")
+                    sev[s] = sev.get(s, 0) + 1
+            except (FileNotFoundError, OSError):
+                pass
+        out = {"runs_total": total, "runs_by_status": by_status,
+               "findings_by_severity": sev,
+               "findings_total": sum(sev.values())}
+        with self.lock:
+            self._overview_cache = (now, out)
+        return out
+
     def kill(self, eid: int) -> bool:
         with self.lock:
             ex = self.execs.get(eid)
@@ -134,6 +183,68 @@ class GuiState:
         if len(data) > cap:
             data = data[-cap:]
         return data.decode("utf-8", "replace")
+
+
+def _pipeline_dag(pipeline: str):
+    """Rebuild a pipeline's DAG for visualization (no execution).
+
+    Stage factories only close over the log; nothing runs at build.
+    """
+    from . import catchall as _catchall
+    from .cli import _build_pipeline
+    from .runner import Runner
+    dag, _ = _build_pipeline(pipeline, None, _catchall, Runner)
+    return dag
+
+
+def dag_with_state(workdir: Path, run_id: int) -> dict:
+    """DAG structure + live node states for one run."""
+    import sqlite3 as _sq
+    db = workdir / "loom.sqlite"
+    pipeline, node_rows, tool_rows = None, {}, {}
+    try:
+        con = _sq.connect(str(db))
+        con.row_factory = _sq.Row
+        try:
+            r = con.execute("SELECT pipeline FROM runs WHERE id=?",
+                            (run_id,)).fetchone()
+            if r is None:
+                return {"error": "unknown run id"}
+            pipeline = r["pipeline"]
+            for t in con.execute(
+                    "SELECT tool, stage, status, duration_s, error "
+                    "FROM tool_runs WHERE run_id=?", (run_id,)):
+                d = dict(t)
+                if d["tool"] == d["stage"]:
+                    node_rows[d["tool"]] = d
+                tool_rows.setdefault(d["stage"], []).append(d)
+        finally:
+            con.close()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    try:
+        dag = _pipeline_dag(pipeline)
+    except Exception as e:
+        return {"error": f"cannot build {pipeline!r} DAG: {e}"}
+    nodes = []
+    for n in dag.nodes():
+        state = node_rows.get(n.id, {}).get("status") or "pending"
+        tools = [{"tool": t["tool"], "status": t["status"],
+                  "duration_s": t["duration_s"],
+                  "error": (t["error"] or "")[:300]}
+                 for t in tool_rows.get(n.id, [])]
+        nodes.append({"id": n.id, "inputs": sorted(n.inputs or []),
+                      "outputs": sorted(n.outputs or []),
+                      "depends_on": list(n.depends_on or []),
+                      "status": state,
+                      "duration_s": node_rows.get(n.id, {}).get("duration_s"),
+                      "tools": tools})
+    try:
+        levels = dag.levels()
+    except Exception:
+        levels = [[n["id"] for n in nodes]]
+    return {"run_id": run_id, "pipeline": pipeline,
+            "levels": levels, "nodes": nodes}
 
 
 def _parse_command(text: str):
@@ -243,6 +354,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({
                     "snapshot": snapshot(self.state.workdir),
                     "executions": self.state.poll_all(),
+                    "overview": self.state.overview(),
                 })
             elif path == "/api/exec":
                 eid = int(q.get("id", ["0"])[0])
@@ -253,6 +365,12 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     meta["log"] = self.state.read_log(eid, full) or ""
                     self._send_json(meta)
+            elif path == "/api/dag":
+                try:
+                    rid = int(q.get("run", ["0"])[0])
+                except (ValueError, TypeError):
+                    rid = 0
+                self._send_json(dag_with_state(self.state.workdir, rid))
             elif path == "/api/findings":
                 from .cli import aggregate_findings
                 try:
@@ -276,6 +394,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if url.path == "/api/run":
                 self._handle_run(self._read_json())
+            elif url.path == "/api/autopilot":
+                self._handle_autopilot(self._read_json())
             elif url.path == "/api/command":
                 self._handle_command(self._read_json())
             elif url.path == "/api/kill":
@@ -313,6 +433,38 @@ class Handler(BaseHTTPRequestHandler):
         argv += ["--max-concurrency", str(max(1, min(conc, 50)))]
         ex = self.state.spawn(argv, f"run {domain} --pipeline {pipeline}",
                               "run")
+        self._send_json({k: v for k, v in ex.items() if k != "proc"})
+
+    def _handle_autopilot(self, body: dict) -> None:
+        raw = body.get("targets", "")
+        if isinstance(raw, str):
+            targets = [t.strip().lower().rstrip(".")
+                       for t in raw.replace(",", "\n").split("\n")]
+        else:
+            targets = [str(t).strip().lower().rstrip(".") for t in raw]
+        targets = [t for t in targets if t and "." in t][:25]
+        if not targets:
+            self._send_json({"error": "no valid targets (need bare domains)"},
+                            400)
+            return
+        intensity = str(body.get("intensity") or "standard")
+        pipeline = AUTOPILOT_PIPELINES.get(intensity, "full")
+        scope_name = str(body.get("scope") or "default")
+        denied = [t for t in targets
+                  if _check_scope(t, scope_name) is not None]
+        if denied:
+            self._send_json({"error": f"scope {scope_name!r} denies: "
+                                      f"{', '.join(denied[:5])}"}, 403)
+            return
+        self.state.logdir.mkdir(parents=True, exist_ok=True)
+        csv_path = self.state.logdir / "autopilot-scopes.csv"
+        csv_path.write_text("".join(f"{t},{pipeline},10\n" for t in targets))
+        argv = ["--workdir", str(self.state.workdir), "sweeps",
+                "--scopes-file", str(csv_path),
+                "--timeout", str(AUTOPILOT_TIMEOUT)]
+        ex = self.state.spawn(
+            argv, f"autopilot {len(targets)} targets → {pipeline}",
+            "autopilot")
         self._send_json({k: v for k, v in ex.items() if k != "proc"})
 
     def _handle_command(self, body: dict) -> None:
@@ -397,7 +549,13 @@ def _default_workdir():
 
 def serve_forever(workdir: Path, port: int = 8080) -> None:
     Handler.state = GuiState(workdir)
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        print(f"error: cannot listen on 127.0.0.1:{port} "
+              f"({e.strerror or e}); is something already on it? "
+              f"try --port", file=sys.stderr)
+        raise SystemExit(2)
     print(f"loom console: http://127.0.0.1:{port}  workdir={workdir}",
           flush=True)
     try:
@@ -478,9 +636,55 @@ PAGE = """<!doctype html>
     margin-top: 8px; max-height: 400px; overflow: auto; font-size: 12px;
     white-space: pre-wrap; word-break: break-all; color: #9a9a9a; }
   .empty { color: #555; padding: 10px 0; }
+  #overview { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+  .stat { border: 1px solid #222; background: #101010; padding: 8px 14px;
+    min-width: 130px; }
+  .stat .v { font-size: 20px; font-weight: 600; color: #e8e8e8; }
+  .stat .k { font-size: 11px; color: #6a6a6a; text-transform: uppercase;
+    letter-spacing: .06em; }
+  textarea { background: #0a0a0a; border: 1px solid #2c2c2c; color: #e8e8e8;
+    font: inherit; font-size: 13px; padding: 6px 9px; width: 100%;
+    min-height: 64px; resize: vertical; }
+  textarea:focus { outline: none; border-color: #4a6a8a; }
+  .seg { display: flex; gap: 0; margin-top: 4px; }
+  .seg button { flex: 1; margin-top: 0; background: #141414;
+    border: 1px solid #2c2c2c; color: #9a9a9a; }
+  .seg button.on { background: #1c2f1c; border-color: #2f542f; color: #9fe09f; }
+  svg.dag { width: 100%; height: auto; display: block; }
+  .dag text { font: 11px ui-monospace, Menlo, Consolas, monospace; }
+  .node { cursor: pointer; }
+  .node rect { stroke-width: 1.5; }
+  .node:hover rect { stroke: #e8e8e8; }
+  .node.sel rect { stroke: #e8e8e8; stroke-width: 2.5; }
+  #node-detail { margin-top: 8px; }
+  canvas.spark { width: 100%; height: 44px; display: block; }
 </style></head>
 <body>
 <header><h1>loom console</h1><span id="workdir">-</span><span id="clock">-</span></header>
+
+<div id="overview">
+  <div class="stat"><div class="v" id="ov-runs">-</div><div class="k">runs</div></div>
+  <div class="stat"><div class="v" id="ov-running">-</div><div class="k">running</div></div>
+  <div class="stat"><div class="v" id="ov-findings">-</div><div class="k">findings</div></div>
+  <div class="stat"><div class="v" id="ov-events">-</div><div class="k">events/min</div></div>
+  <div class="stat"><svg id="donut" width="44" height="44" viewBox="0 0 44 44"></svg></div>
+  <div class="stat" style="flex:1;min-width:220px"><canvas class="spark" id="spark" width="600" height="44"></canvas></div>
+</div>
+
+<h2>autopilot</h2>
+<div class="card">
+  <label>targets — one domain per line (up to 25)</label>
+  <textarea id="a-targets" placeholder="example.com&#10;api.example.com"></textarea>
+  <div class="row">
+    <div><label>intensity</label><div class="seg" id="a-seg">
+      <button data-v="quick">quick</button><button data-v="standard" class="on">standard</button><button data-v="deep">deep</button>
+    </div></div>
+    <div><label>scope profile</label><input type="text" id="a-scope" value="default"></div>
+  </div>
+  <button id="b-auto">start autopilot</button>
+  <span class="hint">quick=catchall · standard=full · deep=deep — one sweep, 2h per-scope cap, scope gate enforced</span>
+  <div class="err-line" id="auto-err"></div>
+</div>
 
 <h2>launch</h2>
 <div class="card">
@@ -606,32 +810,111 @@ function renderExecs(list) {
   el.querySelectorAll('[data-full]').forEach(b => b.onclick = () =>
     toggleFull(parseInt(b.dataset.full, 10)));
 }
-function renderRuns(d) {
-  document.getElementById('workdir').textContent = d.workdir || '';
+const STATUS_FILL = {done:'#1c3a1c', failed:'#3a1c1c', timeout:'#3a1c1c',
+  running:'#3a3016', skipped:'#161616', pending:'#101010'};
+const STATUS_EDGE = {done:'#2f542f', failed:'#542f2f', timeout:'#542f2f',
+  running:'#5a4a1a', skipped:'#2c2c2c', pending:'#222222'};
+const STATUS_TX = {done:'#9fe09f', failed:'#e09f9f', timeout:'#e09f9f',
+  running:'#e8c15a', skipped:'#555555', pending:'#444444'};
+let dagCache = {}, selNode = {};
+function dagSvg(runId, dag) {
+  const W = 150, H = 44, GAPX = 26, GAPY = 14, PAD = 8;
+  const levels = dag.levels || [];
+  const byId = {};
+  (dag.nodes || []).forEach(n => byId[n.id] = n);
+  const maxRows = Math.max.apply(null, levels.map(l => l.length).concat([1]));
+  const width = levels.length * (W + GAPX) + PAD * 2 - GAPX;
+  const height = maxRows * (H + GAPY) + PAD * 2 - GAPY;
+  let s = '<svg class="dag" viewBox="0 0 ' + width + ' ' + height + '">';
+  const pos = {};
+  levels.forEach((lvl, li) => lvl.forEach((nid, ri) => {
+    pos[nid] = {x: PAD + li * (W + GAPX), y: PAD + ri * (H + GAPY)};
+  }));
+  Object.keys(pos).forEach(nid => {
+    const n = byId[nid] || {depends_on: []};
+    (n.depends_on || []).forEach(dep => {
+      if (!pos[dep]) return;
+      const a = pos[dep], b = pos[nid];
+      s += '<line x1="' + (a.x + W) + '" y1="' + (a.y + H/2) +
+           '" x2="' + b.x + '" y2="' + (b.y + H/2) +
+           '" stroke="#333" stroke-width="1.5"/>';
+    });
+  });
+  Object.keys(pos).forEach(nid => {
+    const n = byId[nid] || {id: nid, status: 'pending', tools: []};
+    const p = pos[nid], st = n.status || 'pending';
+    const sel = selNode[runId] === nid ? ' sel' : '';
+    const label = nid.length > 18 ? nid.slice(0, 17) + '…' : nid;
+    const sub = (n.tools || []).length
+      ? n.tools.length + ' tools' : st;
+    s += '<g class="node' + sel + '" data-run="' + runId +
+         '" data-node="' + esc(nid) + '">' +
+      '<rect x="' + p.x + '" y="' + p.y + '" width="' + W + '" height="' + H +
+      '" rx="4" fill="' + (STATUS_FILL[st] || '#101010') +
+      '" stroke="' + (STATUS_EDGE[st] || '#222') + '"/>' +
+      '<text x="' + (p.x + 8) + '" y="' + (p.y + 18) +
+      '" fill="' + (STATUS_TX[st] || '#888') + '">' + esc(label) + '</text>' +
+      '<text x="' + (p.x + 8) + '" y="' + (p.y + 33) + '" fill="#666">' +
+      esc(sub) + '</text></g>';
+  });
+  return s + '</svg>';
+}
+function renderNodeDetail(runId, dag) {
+  const el = document.getElementById('node-detail-' + runId);
+  if (!el) return;
+  const nid = selNode[runId];
+  const n = (dag.nodes || []).find(x => x.id === nid);
+  if (!n) { el.innerHTML = '<div class="hint">click a stage for tool detail</div>'; return; }
+  const dur = n.duration_s != null ? ' · ' + fmtDur(n.duration_s) : '';
+  let h = '<div class="hint">' + esc(nid) + ' · ' + esc(n.status) + dur + '</div>';
+  if (n.tools && n.tools.length) {
+    h += '<table><tr><th>tool</th><th>status</th><th>duration</th></tr>' +
+      n.tools.map(t =>
+        '<tr><td class="tool">' + esc(t.tool) + '</td>' +
+        '<td class="' + cls(t.status) + '">' + esc(t.status) + '</td>' +
+        '<td class="dur">' + fmtDur(t.duration_s) + '</td></tr>' +
+        (t.error ? '<tr><td></td><td class="err" colspan="2">' +
+          esc(t.error).slice(0, 300) + '</td></tr>' : '')).join('') +
+      '</table>';
+  }
+  el.innerHTML = h;
+}
+async function renderRuns(snap) {
+  document.getElementById('workdir').textContent = snap.workdir || '';
   const el = document.getElementById('runs');
-  const runs = d.runs || [];
+  const runs = snap.runs || [];
   if (!runs.length) { el.innerHTML = '<div class="empty">no runs in this workdir</div>'; return; }
-  el.innerHTML = runs.map(r => {
-    const stages = (r.stages && r.stages.length)
-      ? '<table><tr><th>tool</th><th>stage</th><th>status</th><th>duration</th></tr>' +
-        r.stages.map(s =>
-          '<tr><td class="tool">' + esc(s.tool) + '</td>' +
-          '<td class="stage">' + esc(s.stage) + '</td>' +
-          '<td class="' + cls(s.status) + '">' + esc(s.status) + '</td>' +
-          '<td class="dur">' + fmtDur(s.duration_s) + '</td></tr>' +
-          ((s.status === 'failed' || s.status === 'timeout') && s.error
-            ? '<tr><td></td><td class="err" colspan="3">' +
-              esc(s.error).slice(0, 300) + '</td></tr>' : '')
-        ).join('') + '</table>'
-      : '<div class="empty">no stages yet</div>';
-    return '<div class="run"><div class="run-head">' +
+  let h = '';
+  for (const r of runs) {
+    let dag = dagCache[r.id];
+    try {
+      const rr = await fetch('/api/dag?run=' + r.id);
+      dag = await rr.json();
+      if (!dag.error) dagCache[r.id] = dag;
+    } catch (e) { /* keep cached */ }
+    if (!dag || dag.error) {
+      h += '<div class="run"><div class="run-head"><span class="rid">run ' + r.id +
+        '</span><span class="domain">' + esc(r.domain) + '</span></div></div>';
+      continue;
+    }
+    h += '<div class="run"><div class="run-head">' +
       '<span class="rid">run ' + r.id + '</span>' +
       '<span class="domain">' + esc(r.domain) + '</span>' +
-      '<span class="pipeline">' + esc(r.pipeline || '') + '</span>' +
+      '<span class="pipeline">' + esc(dag.pipeline || r.pipeline || '') + '</span>' +
       '<span class="' + cls(r.status) + '">' + esc(r.status) + '</span>' +
       '<span class="timer">' + fmtDur(r.elapsed_s) + '</span>' +
-      '</div>' + stages + '</div>';
-  }).join('');
+      '</div>' + dagSvg(r.id, dag) +
+      '<div id="node-detail-' + r.id + '"></div></div>';
+  }
+  el.innerHTML = h;
+  el.querySelectorAll('.node').forEach(g => g.onclick = () => {
+    const rid = parseInt(g.dataset.run, 10);
+    selNode[rid] = g.dataset.node;
+    el.querySelectorAll('.node').forEach(x => x.classList.remove('sel'));
+    g.classList.add('sel');
+    renderNodeDetail(rid, dagCache[rid]);
+  });
+  runs.forEach(r => { if (dagCache[r.id]) renderNodeDetail(r.id, dagCache[r.id]); });
 }
 function sevCls(s) { return 'sev-' + (s || 'info'); }
 async function loadFindings() {
@@ -694,10 +977,81 @@ async function tick() {
     const d = await r.json();
     document.getElementById('clock').textContent = new Date().toLocaleTimeString();
     renderExecs(d.executions || []);
+    renderOverview(d.overview || {}, d.snapshot || {});
     renderRuns(d.snapshot || {});
     refreshFileRuns((d.snapshot && d.snapshot.runs) || []);
   } catch (e) { /* server still booting */ }
 }
+const SEV_COLORS = {critical:'#ff5f5f', high:'#e05f5f', medium:'#e8c15a',
+  low:'#7ab8e0', info:'#555555'};
+let evHist = [];
+function renderOverview(ov, snap) {
+  document.getElementById('ov-runs').textContent = ov.runs_total || 0;
+  const rb = ov.runs_by_status || {};
+  document.getElementById('ov-running').textContent = rb.running || 0;
+  document.getElementById('ov-findings').textContent = ov.findings_total || 0;
+  const sev = ov.findings_by_severity || {};
+  const total = Object.values(sev).reduce((a, b) => a + b, 0);
+  let a0 = -Math.PI / 2, arcs = '';
+  Object.keys(sev).forEach(k => {
+    const frac = total ? sev[k] / total : 0;
+    const a1 = a0 + frac * Math.PI * 2;
+    if (frac <= 0) return;
+    const large = (a1 - a0) > Math.PI ? 1 : 0;
+    const x0 = 22 + 16 * Math.cos(a0), y0 = 22 + 16 * Math.sin(a0);
+    const x1 = 22 + 16 * Math.cos(a1), y1 = 22 + 16 * Math.sin(a1);
+    arcs += '<path d="M22,22 L' + x0.toFixed(1) + ',' + y0.toFixed(1) +
+      ' A16,16 0 ' + large + ',1 ' + x1.toFixed(1) + ',' + y1.toFixed(1) +
+      ' Z" fill="' + (SEV_COLORS[k] || '#555') + '"/>';
+    a0 = a1;
+  });
+  document.getElementById('donut').innerHTML = arcs ||
+    '<circle cx="22" cy="22" r="16" fill="none" stroke="#222" stroke-width="8"/>';
+  let ev = 0;
+  Object.values((snap.event_counts) || {}).forEach(v => ev += v);
+  const now = Date.now();
+  evHist.push([now, ev]);
+  evHist = evHist.filter(p => now - p[0] < 10 * 60 * 1000).slice(-120);
+  let rate = 0;
+  if (evHist.length > 1) {
+    const dt = (evHist[evHist.length - 1][0] - evHist[0][0]) / 60000;
+    if (dt > 0.02) rate = Math.round((ev - evHist[0][1]) / dt);
+  }
+  document.getElementById('ov-events').textContent = rate;
+  const cv = document.getElementById('spark'), cx = cv.getContext('2d');
+  cx.clearRect(0, 0, cv.width, cv.height);
+  if (evHist.length > 1) {
+    const ys = evHist.map(p => p[1]);
+    const lo = Math.min.apply(null, ys), hi = Math.max.apply(null, ys);
+    const span = (hi - lo) || 1;
+    cx.strokeStyle = '#4a6a8a'; cx.lineWidth = 1.5; cx.beginPath();
+    evHist.forEach((p, i) => {
+      const x = i / (evHist.length - 1) * cv.width;
+      const y = cv.height - 3 - (p[1] - lo) / span * (cv.height - 6);
+      i ? cx.lineTo(x, y) : cx.moveTo(x, y);
+    });
+    cx.stroke();
+  }
+}
+let intensity = 'standard';
+document.getElementById('a-seg').querySelectorAll('button').forEach(b =>
+  b.onclick = () => {
+    intensity = b.dataset.v;
+    document.getElementById('a-seg').querySelectorAll('button')
+      .forEach(x => x.classList.toggle('on', x === b));
+  });
+document.getElementById('b-auto').onclick = async () => {
+  const err = document.getElementById('auto-err'); err.textContent = '';
+  const btn = document.getElementById('b-auto'); btn.disabled = true;
+  try {
+    await post('/api/autopilot', {
+      targets: document.getElementById('a-targets').value,
+      intensity: intensity,
+      scope: document.getElementById('a-scope').value});
+    tick();
+  } catch (e) { err.textContent = e.message; }
+  btn.disabled = false;
+};
 tick();
 setInterval(tick, 2000);
 </script>

@@ -66,8 +66,9 @@ class TestGuiPage:
         status, body = get(base, "/api/state")
         assert status == 200
         doc = json.loads(body)
-        assert set(doc) == {"snapshot", "executions"}
+        assert {"snapshot", "executions", "overview"} <= set(doc)
         assert doc["snapshot"]["runs"] == []
+        assert doc["overview"]["runs_total"] == 0
 
 
 class TestGuiRunValidation:
@@ -151,3 +152,82 @@ class TestGuiFiles:
             _cli.main(["gui", "--help"])
         out = capsys.readouterr().out
         assert "--port" in out
+
+
+class TestAutopilot:
+    def test_empty_targets_is_400(self, server):
+        base, _ = server
+        status, doc = post(base, "/api/autopilot",
+                           {"targets": "   \n,", "intensity": "quick"})
+        assert status == 400
+
+    def test_denied_scope_is_403(self, server):
+        base, _ = server
+        status, _ = post(base, "/api/autopilot",
+                         {"targets": "example.com",
+                          "intensity": "quick", "scope": "nonexistent"})
+        assert status == 403
+
+    def test_autopilot_spawns_sweep(self, server, monkeypatch):
+        base, tmp_path = server
+        seen = []
+        from loom import webgui as _wg
+        orig_spawn = _wg.GuiState.spawn
+
+        def fake_spawn(self, argv, label, kind):
+            seen.append((argv, label, kind))
+            return {"id": 99, "kind": kind, "label": label,
+                    "argv": argv, "pid": 1, "log": "x",
+                    "started": 0.0, "finished": None, "rc": None,
+                    "killed": False}
+
+        monkeypatch.setattr(_wg.GuiState, "spawn", fake_spawn)
+        status, doc = post(base, "/api/autopilot",
+                           {"targets": "a.example.com\nb.example.com",
+                            "intensity": "deep"})
+        assert status == 200, doc
+        argv, label, kind = seen[0]
+        assert kind == "autopilot"
+        assert "sweeps" in argv and "--timeout" in argv
+        csv = tmp_path / "gui-logs" / "autopilot-scopes.csv"
+        assert csv.exists()
+        assert "a.example.com,deep,10" in csv.read_text()
+
+    def test_dag_endpoint(self, server):
+        import sqlite3
+        base, tmp_path = server
+        con = sqlite3.connect(str(tmp_path / "loom.sqlite"))
+        con.execute("CREATE TABLE runs (id INTEGER PRIMARY KEY, domain TEXT,"
+                    " pipeline TEXT, started_at REAL, finished_at REAL)")
+        con.execute("CREATE TABLE tool_runs (run_id INTEGER, host TEXT, tool TEXT,"
+                    " stage TEXT, status TEXT, started_at REAL, finished_at REAL,"
+                    " output_path TEXT, error TEXT, duration_s REAL)")
+        con.execute("INSERT INTO runs VALUES (1,'example.com','catchall',0,1)")
+        con.commit()
+        con.close()
+        status, body = get(base, "/api/dag?run=1")
+        assert status == 200
+        doc = json.loads(body)
+        assert doc["pipeline"] == "catchall"
+        assert doc["levels"] == [["catchall"]]
+        assert doc["nodes"][0]["status"] in ("done", "pending")
+
+    def test_dag_unknown_run(self, server):
+        base, _ = server
+        status, body = get(base, "/api/dag?run=99")
+        assert status == 200
+        assert json.loads(body).get("error")
+
+    def test_port_in_use_exits_2(self, tmp_path):
+        import socket
+        from loom import webgui as _wg
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+        try:
+            with pytest.raises(SystemExit) as exc:
+                _wg.serve_forever(tmp_path, port)
+            assert exc.value.code == 2
+        finally:
+            s.close()
